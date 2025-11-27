@@ -15,6 +15,241 @@ from yolo_detector import FaceClothingDetector
 from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
 
 
+# API Resources классы должны быть определены ДО создания сервера
+class VideoControl(Resource):
+    def get(self):
+        """Статус видео потока"""
+        try:
+            status = {
+                'processing': server.processing,
+                'rtsp_url': server.rtsp_url,
+                'active_visitors': len(server.active_visitors),
+                'total_visitors': server.visitor_counter,
+                'last_processed': server.last_processed.isoformat() if server.last_processed else None,
+                'frame_available': server.frame is not None
+            }
+            return status, 200
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+    def post(self):
+        """Управление видео потоком"""
+        try:
+            data = request.get_json()
+            if not data:
+                return {'error': 'No JSON data provided'}, 400
+
+            action = data.get('action')
+
+            if action == 'start':
+                if server.start_video_stream():
+                    return {'message': 'Video stream started'}, 200
+                else:
+                    return {'error': 'Failed to start video stream'}, 400
+
+            elif action == 'stop':
+                server.stop_video_stream()
+                return {'message': 'Video stream stopped'}, 200
+
+            else:
+                return {'error': 'Invalid action. Use "start" or "stop"'}, 400
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class VideoStream(Resource):
+    def get(self):
+        """Потоковое видео с детекциями"""
+
+        def generate():
+            while True:
+                try:
+                    # Получаем текущий кадр
+                    frame = server.get_current_frame()
+
+                    # Если есть активная обработка, добавляем детекции
+                    if server.processing and server.frame is not None:
+                        tracks = server.process_frame(frame)
+
+                        # Рисуем bounding boxes и ID
+                        for track_id, track in tracks.items():
+                            x, y, w, h = track['bbox']
+                            x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+
+                            # Рисуем прямоугольник
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                            # Добавляем ID
+                            cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+                    # Добавляем общую статистику
+                    cv2.putText(frame, f'Active Visitors: {len(server.active_visitors)}',
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(frame, f'Total Detected: {server.visitor_counter}',
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.putText(frame, f'Status: {"LIVE" if server.processing else "TEST"}',
+                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                    # Кодируем в JPEG
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ret:
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    else:
+                        # Fallback: черный кадр
+                        black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                        ret, buffer = cv2.imencode('.jpg', black_frame)
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+                    time.sleep(0.067)  # ~15 FPS для стрима
+
+                except Exception as e:
+                    print(f"Error generating stream: {e}")
+                    # Fallback на тестовый кадр при ошибке
+                    try:
+                        test_frame = server.test_frame
+                        ret, buffer = cv2.imencode('.jpg', test_frame)
+                        yield (b'--frame\r\n'
+                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                    except:
+                        pass
+                    time.sleep(1)
+
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+class ProcessImage(Resource):
+    def post(self):
+        """Обработка единичного изображения"""
+        try:
+            if 'image' not in request.files:
+                return {'error': 'No image file'}, 400
+
+            file = request.files['image']
+            img_bytes = file.read()
+            img_np = np.frombuffer(img_bytes, np.uint8)
+            frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                return {'error': 'Invalid image'}, 400
+
+            # Обработка кадра
+            tracks = server.process_frame(frame)
+
+            return {
+                'tracks': tracks,
+                'visitor_count': len(server.active_visitors),
+                'total_visitors': server.visitor_counter
+            }, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class Visitors(Resource):
+    def get(self):
+        """Получение списка посетителей"""
+        try:
+            page = request.args.get('page', 1, type=int)
+            per_page = request.args.get('per_page', 20, type=int)
+
+            with server.app.app_context():
+                visitors = Visitor.query.order_by(Visitor.last_seen.desc()).paginate(
+                    page=page, per_page=per_page, error_out=False)
+
+                result = {
+                    'visitors': [{
+                        'id': v.id,
+                        'track_id': v.track_id,
+                        'first_seen': v.first_seen.isoformat(),
+                        'last_seen': v.last_seen.isoformat(),
+                        'visit_count': v.visit_count,
+                        'is_active': v.is_active
+                    } for v in visitors.items],
+                    'total': visitors.total,
+                    'pages': visitors.pages,
+                    'current_page': page
+                }
+
+                return result, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class Reports(Resource):
+    def post(self):
+        """Генерация отчета"""
+        try:
+            data = request.get_json()
+            if not data:
+                return {'error': 'No JSON data provided'}, 400
+
+            report_type = data.get('report_type')
+            start_date_str = data.get('start_date')
+            end_date_str = data.get('end_date')
+
+            if not report_type or not start_date_str or not end_date_str:
+                return {'error': 'Missing required fields: report_type, start_date, end_date'}, 400
+
+            start_date = datetime.fromisoformat(start_date_str)
+            end_date = datetime.fromisoformat(end_date_str)
+
+            report_id = server.generate_report(report_type, start_date, end_date)
+
+            return {'report_id': report_id, 'message': 'Report generated successfully'}, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+    def get(self):
+        """Получение отчетов"""
+        try:
+            with server.app.app_context():
+                reports = Report.query.order_by(Report.generated_at.desc()).all()
+
+                result = [{
+                    'id': r.id,
+                    'report_type': r.report_type,
+                    'generated_at': r.generated_at.isoformat(),
+                    'data': json.loads(r.data) if r.data else {}
+                } for r in reports]
+
+                return result, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class Statistics(Resource):
+    def get(self):
+        """Получение статистики"""
+        try:
+            with server.app.app_context():
+                total_visitors = Visitor.query.count()
+                active_visitors = Visitor.query.filter_by(is_active=True).count()
+                today_visitors = Visitor.query.filter(
+                    Visitor.first_seen >= datetime.now().date()
+                ).count()
+
+                return {
+                    'total_visitors': total_visitors,
+                    'active_visitors': active_visitors,
+                    'today_visitors': today_visitors,
+                    'currently_tracking': len(server.active_visitors),
+                    'processing_status': server.processing,
+                    'rtsp_stream': server.rtsp_url,
+                    'server_uptime': str(
+                        datetime.now() - server_start_time) if 'server_start_time' in globals() else 'unknown'
+                }, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
 class VideoAnalyticsServer:
     def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
         self.app = Flask(__name__)
@@ -161,6 +396,7 @@ class VideoAnalyticsServer:
                 'frame_available': self.frame is not None
             })
 
+        # Регистрируем API ресурсы
         self.api.add_resource(VideoControl, '/api/video_control')
         self.api.add_resource(VideoStream, '/api/video_stream')
         self.api.add_resource(Visitors, '/api/visitors')
@@ -455,114 +691,6 @@ class VideoAnalyticsServer:
         print(f"Starting Video Analytics Server on {host}:{port}")
         self.app.run(host=host, port=port, debug=False)
 
-
-# API Resources
-class VideoControl(Resource):
-    def get(self):
-        """Статус видео потока"""
-        try:
-            status = {
-                'processing': server.processing,
-                'rtsp_url': server.rtsp_url,
-                'active_visitors': len(server.active_visitors),
-                'total_visitors': server.visitor_counter,
-                'last_processed': server.last_processed.isoformat() if server.last_processed else None,
-                'frame_available': server.frame is not None
-            }
-            return status, 200
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-    def post(self):
-        """Управление видео потоком"""
-        try:
-            data = request.get_json()
-            if not data:
-                return {'error': 'No JSON data provided'}, 400
-
-            action = data.get('action')
-
-            if action == 'start':
-                if server.start_video_stream():
-                    return {'message': 'Video stream started'}, 200
-                else:
-                    return {'error': 'Failed to start video stream'}, 400
-
-            elif action == 'stop':
-                server.stop_video_stream()
-                return {'message': 'Video stream stopped'}, 200
-
-            else:
-                return {'error': 'Invalid action. Use "start" or "stop"'}, 400
-
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-
-class VideoStream(Resource):
-    def get(self):
-        """Потоковое видео с детекциями"""
-
-        def generate():
-            while True:
-                try:
-                    # Получаем текущий кадр
-                    frame = server.get_current_frame()
-
-                    # Если есть активная обработка, добавляем детекции
-                    if server.processing and server.frame is not None:
-                        tracks = server.process_frame(frame)
-
-                        # Рисуем bounding boxes и ID
-                        for track_id, track in tracks.items():
-                            x, y, w, h = track['bbox']
-                            x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
-
-                            # Рисуем прямоугольник
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-                            # Добавляем ID
-                            cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                    # Добавляем общую статистику
-                    cv2.putText(frame, f'Active Visitors: {len(server.active_visitors)}',
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.putText(frame, f'Total Detected: {server.visitor_counter}',
-                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    cv2.putText(frame, f'Status: {"LIVE" if server.processing else "TEST"}',
-                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                    # Кодируем в JPEG
-                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ret:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                    else:
-                        # Fallback: черный кадр
-                        black_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                        ret, buffer = cv2.imencode('.jpg', black_frame)
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-
-                    time.sleep(0.067)  # ~15 FPS для стрима
-
-                except Exception as e:
-                    print(f"Error generating stream: {e}")
-                    # Fallback на тестовый кадр при ошибке
-                    try:
-                        test_frame = server.test_frame
-                        ret, buffer = cv2.imencode('.jpg', test_frame)
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                    except:
-                        pass
-                    time.sleep(1)
-
-        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-# ... остальные классы API остаются без изменений ...
 
 # Глобальный экземпляр сервера
 server = VideoAnalyticsServer()
