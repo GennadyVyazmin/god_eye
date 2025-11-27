@@ -71,14 +71,19 @@ class YOLODetector:
                         if cls == self.person_class_id and conf >= self.conf_threshold:
                             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
-                            feature = self._extract_feature(image, bbox)
 
-                            detections.append({
-                                'bbox': bbox,
-                                'confidence': float(conf),
-                                'class': cls,
-                                'feature': feature
-                            })
+                            # Фильтр по размеру - убираем слишком маленькие детекции
+                            if bbox[2] > 50 and bbox[3] > 100:  # min width 50px, min height 100px
+                                feature = self._extract_feature(image, bbox)
+
+                                detections.append({
+                                    'bbox': bbox,
+                                    'confidence': float(conf),
+                                    'class': cls,
+                                    'feature': feature
+                                })
+                            else:
+                                print(f"  Filtered small detection: {bbox}")
 
             else:  # torchhub
                 results = self.model(image_rgb)
@@ -90,14 +95,19 @@ class YOLODetector:
 
                         if int(cls) == self.person_class_id and conf >= self.conf_threshold:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
-                            feature = self._extract_feature(image, bbox)
 
-                            detections.append({
-                                'bbox': bbox,
-                                'confidence': float(conf),
-                                'class': int(cls),
-                                'feature': feature
-                            })
+                            # Фильтр по размеру
+                            if bbox[2] > 50 and bbox[3] > 100:
+                                feature = self._extract_feature(image, bbox)
+
+                                detections.append({
+                                    'bbox': bbox,
+                                    'confidence': float(conf),
+                                    'class': int(cls),
+                                    'feature': feature
+                                })
+                            else:
+                                print(f"  Filtered small detection: {bbox}")
 
             return detections
 
@@ -269,7 +279,7 @@ class FaceClothingDetector:
         print(f"Using detector: {self.detector_type}")
 
     def detect_face_and_clothing(self, image):
-        """Детекция людей с разделением на лицо и одежду"""
+        """Детекция людей - возвращаем ТОЛЬКО уникальные детекции"""
         detections = self.detector.detect(image)
 
         # Логируем количество обнаруженных людей
@@ -277,6 +287,6 @@ class FaceClothingDetector:
             confidences = [d['confidence'] for d in detections]
             print(f"Detected {len(detections)} person(s) with confidence: {confidences}")
 
-        # Для упрощения возвращаем одинаковые детекции для лица и одежды
-        # В реальной системе здесь должно быть разделение
-        return detections, detections
+        # Вместо дублирования возвращаем пустой список для clothing
+        # Это предотвратит двойные детекции одного и того же человека
+        return detections, []  # Только лица, одежда пустая

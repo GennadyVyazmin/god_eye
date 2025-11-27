@@ -7,11 +7,9 @@ import base64
 from flask import Flask, request, jsonify, Response
 from flask_restful import Api, Resource
 from flask_socketio import SocketIO, emit
-from yolo_detector import FaceClothingDetector
 import threading
 import time
 import os
-
 
 # Настройки для OpenCV
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
@@ -38,15 +36,16 @@ class VideoAnalyticsServer:
 
         # Инициализация детектора и трекера
         print("Initializing FaceClothingDetector...")
-        self.detector = FaceClothingDetector(use_yolo=True)  # Используем YOLO детектор
+        self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.7)  # Увеличили порог matching_threshold
+        # Более мягкие параметры для лучшего трекинга
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.6)  # Средний порог
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.9,  # Увеличили max_iou_distance
-            max_age=100,  # Увеличили max_age
-            n_init=3  # Уменьшили n_init для быстрого подтверждения
+            max_iou_distance=0.8,  # Увеличили max_iou_distance
+            max_age=30,  # Средний max_age
+            n_init=2  # Минимальный n_init для быстрого подтверждения
         )
 
         # Видео поток
@@ -167,7 +166,7 @@ class VideoAnalyticsServer:
                     except Exception as e:
                         print(f"Error drawing detections: {e}")
 
-                # Добавляем статистику
+                # Добавляем общую статистику
                 status_text = "LIVE" if self.processing and self.frame is not None else "NO SIGNAL"
                 status_color = (0, 255, 0) if self.processing and self.frame is not None else (0, 0, 255)
 
@@ -649,21 +648,39 @@ class VideoAnalyticsServer:
             # Конвертация в формат DeepSORT
             deepsort_detections = []
             for i, det in enumerate(all_detections):
-                bbox = det['bbox']
-                confidence = det['confidence']
-                feature = det['feature']
+                try:
+                    bbox = det['bbox']
+                    confidence = det['confidence']
+                    feature = det['feature']
 
-                deepsort_det = DeepSortDetection(bbox, confidence, feature)
-                deepsort_detections.append(deepsort_det)
-                print(f"  Detection {i}: bbox={bbox}, conf={confidence:.3f}")
+                    # Проверяем валидность bbox
+                    if (bbox[2] > 0 and bbox[3] > 0 and  # width and height > 0
+                            bbox[0] >= 0 and bbox[1] >= 0 and  # x, y >= 0
+                            bbox[0] + bbox[2] <= frame.shape[1] and  # x + width <= frame width
+                            bbox[1] + bbox[3] <= frame.shape[0]):  # y + height <= frame height
+
+                        deepsort_det = DeepSortDetection(bbox, confidence, feature)
+                        deepsort_detections.append(deepsort_det)
+                        print(f"  Detection {i}: bbox={[int(x) for x in bbox]}, conf={confidence:.3f}")
+                    else:
+                        print(f"  Detection {i}: INVALID bbox {bbox}")
+                except Exception as e:
+                    print(f"  Error processing detection {i}: {e}")
+                    continue
 
             # Логируем состояние трекера до обновления
-            print(
-                f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {len([t for t in self.tracker.tracks if t.is_confirmed()])})")
+            confirmed_before = len([t for t in self.tracker.tracks if t.is_confirmed()])
+            print(f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {confirmed_before})")
 
             # Обновление трекера
             self.tracker.predict()
-            self.tracker.update(deepsort_detections)
+
+            # Обрабатываем случай когда нет детекций
+            if len(deepsort_detections) == 0:
+                print("No valid detections to update tracker")
+                self.tracker.update([])
+            else:
+                self.tracker.update(deepsort_detections)
 
             # Логируем состояние трекера после обновления
             confirmed_tracks = [t for t in self.tracker.tracks if t.is_confirmed()]
@@ -672,27 +689,38 @@ class VideoAnalyticsServer:
             # Обработка треков
             current_tracks = {}
             for track in confirmed_tracks:
-                track_id = track.track_id
-                bbox = track.mean[:4].copy()
-                bbox[2] *= bbox[3]
-                bbox[:2] -= bbox[2:] / 2
+                try:
+                    track_id = track.track_id
+                    bbox = track.mean[:4].copy()
+                    bbox[2] *= bbox[3]  # convert to [x, y, w, h] format
+                    bbox[:2] -= bbox[2:] / 2
 
-                # Убедимся, что координаты валидны
-                bbox = [max(0, float(coord)) for coord in bbox]
+                    # Убедимся, что координаты валидны
+                    bbox = [max(0, float(coord)) for coord in bbox]
 
-                current_tracks[track_id] = {
-                    'bbox': bbox,
-                    'track_id': track_id,
-                    'confidence': getattr(track, 'confidence', 1.0),
-                    'hits': track.hits
-                }
+                    # Проверяем что bbox внутри кадра
+                    if (bbox[0] < frame.shape[1] and bbox[1] < frame.shape[0] and
+                            bbox[2] > 10 and bbox[3] > 10):  # минимальный размер
 
-                print(f"  Track {track_id}: bbox={bbox}, hits={track.hits}")
+                        current_tracks[track_id] = {
+                            'bbox': bbox,
+                            'track_id': track_id,
+                            'confidence': getattr(track, 'confidence', 1.0),
+                            'hits': track.hits
+                        }
 
-                # Обновление/создание посетителя в БД (только для новых треков)
-                if track_id not in self.active_visitors:
-                    print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
-                    self.update_visitor(track_id, bbox, frame)
+                        print(f"  Track {track_id}: bbox={[int(x) for x in bbox]}, hits={track.hits}")
+
+                        # Обновление/создание посетителя в БД (только для новых треков)
+                        if track_id not in self.active_visitors:
+                            print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
+                            self.update_visitor(track_id, bbox, frame)
+                    else:
+                        print(f"  Track {track_id}: INVALID bbox {bbox}")
+
+                except Exception as e:
+                    print(f"  Error processing track {getattr(track, 'track_id', 'unknown')}: {e}")
+                    continue
 
             # Обновление активных посетителей
             self.update_active_visitors(current_tracks)
@@ -700,6 +728,7 @@ class VideoAnalyticsServer:
             # Логируем активные треки
             if len(current_tracks) > 0:
                 print(f"Active tracks: {list(current_tracks.keys())}")
+                print(f"Active visitors: {len(self.active_visitors)}")
             else:
                 print("No active tracks")
 
@@ -707,6 +736,8 @@ class VideoAnalyticsServer:
 
         except Exception as e:
             print(f"Error in process_frame: {e}")
+            import traceback
+            traceback.print_exc()
             return {}
 
     def update_visitor(self, track_id, bbox, frame):

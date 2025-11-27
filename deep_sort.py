@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from typing import List, Tuple
 import cv2
-import scipy.linalg  # Добавляем этот импорт
+import scipy.linalg
 
 
 class KalmanFilter:
@@ -192,31 +192,31 @@ class Tracker:
             track.predict(self.kf)
 
     def update(self, detections):
-        if len(detections) == 0:
-            # Нет детекций - помечаем все треки как пропущенные
-            for track in self.tracks:
-                track.mark_missed()
-            # Удаляем помеченные для удаления треки
+        """Perform measurement update and track management."""
+        try:
+            # Run matching cascade.
+            matches, unmatched_tracks, unmatched_detections = self._match(detections)
+
+            # Update track set.
+            for track_idx, detection_idx in matches:
+                if track_idx < len(self.tracks) and detection_idx < len(detections):
+                    self.tracks[track_idx].update(self.kf, detections[detection_idx])
+
+            for track_idx in unmatched_tracks:
+                if track_idx < len(self.tracks):
+                    self.tracks[track_idx].mark_missed()
+
+            for detection_idx in unmatched_detections:
+                if detection_idx < len(detections):
+                    self._initiate_track(detections[detection_idx])
+
+            # Remove deleted tracks.
             self.tracks = [t for t in self.tracks if not t.is_deleted()]
-            return
 
-        # Matching
-        matches, unmatched_tracks, unmatched_detections = self._match(detections)
-
-        # Update matched tracks
-        for track_idx, detection_idx in matches:
-            self.tracks[track_idx].update(self.kf, detections[detection_idx])
-
-        # Create new tracks for unmatched detections
-        for detection_idx in unmatched_detections:
-            self._initiate_track(detections[detection_idx])
-
-        # Mark unmatched tracks
-        for track_idx in unmatched_tracks:
-            self.tracks[track_idx].mark_missed()
-
-        # Remove deleted tracks
-        self.tracks = [t for t in self.tracks if not t.is_deleted()]
+        except Exception as e:
+            print(f"Error in tracker update: {e}")
+            # В случае ошибки просто удаляем невалидные треки
+            self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
     def _match(self, detections):
         if len(self.tracks) == 0:
