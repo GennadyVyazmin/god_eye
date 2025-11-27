@@ -25,16 +25,14 @@ def main():
         print("Warning: No GPU detected. Using CPU mode.")
 
     # Запуск сервера
-    from analytics_server import VideoAnalyticsServer
-    server = VideoAnalyticsServer(rtsp_url=args.rtsp)
+    from analytics_server import server
 
     print(f"Server starting on http://{args.host}:{args.port}")
     print(f"RTSP stream: {args.rtsp}")
     print("Available endpoints:")
-    print("  GET / - Main page with video stream")
+    print("  GET / - Main page with WebSocket video stream")
     print("  GET /api/status - Server status")
-    print("  GET /api/video_control - Video stream status")
-    print("  GET /api/video_stream - Live video stream with detections")
+    print("  GET /api/snapshot - Current snapshot")
     print("  GET /api/visitors - List visitors")
     print("  GET /api/statistics - Statistics")
 

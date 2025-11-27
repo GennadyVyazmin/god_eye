@@ -6,6 +6,7 @@ import json
 import base64
 from flask import Flask, request, jsonify, Response
 from flask_restful import Api, Resource
+from flask_socketio import SocketIO, emit
 import threading
 import time
 import os
@@ -18,217 +19,18 @@ from models import db, Visitor, Detection, Appearance, Report
 from yolo_detector import FaceClothingDetector
 from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
 
-
-# API Resources классы
-class VideoControl(Resource):
-    def get(self):
-        """Статус видео потока"""
-        try:
-            status = {
-                'processing': server.processing,
-                'rtsp_url': server.rtsp_url,
-                'active_visitors': len(server.active_visitors),
-                'total_visitors': server.visitor_counter,
-                'last_processed': server.last_processed.isoformat() if server.last_processed else None,
-                'frame_available': server.frame is not None,
-                'stream_info': server.get_stream_info(),
-                'backend': server.backend_name,
-                'frames_processed': server.frames_processed,
-                'frames_read': server.frames_read
-            }
-            return status, 200
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-
-class VideoStream(Resource):
-    def get(self):
-        """Потоковое видео с детекциями"""
-
-        def generate():
-            frame_count = 0
-            last_log_time = time.time()
-
-            while True:
-                try:
-                    # Получаем текущий кадр
-                    frame = server.get_current_frame()
-
-                    # Логируем каждые 10 секунд
-                    current_time = time.time()
-                    if current_time - last_log_time > 10:
-                        print(
-                            f"Stream: Sent {frame_count} frames, processing: {server.processing}, frame available: {server.frame is not None}")
-                        last_log_time = current_time
-
-                    # Если есть активная обработка и реальный кадр, добавляем детекции
-                    if server.processing and server.frame is not None:
-                        tracks = server.process_frame(frame)
-
-                        # Рисуем bounding boxes и ID
-                        for track_id, track in tracks.items():
-                            x, y, w, h = track['bbox']
-                            x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
-
-                            # Рисуем прямоугольник
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-                            # Добавляем ID
-                            cv2.putText(frame, f'ID: {track_id}', (x1, max(y1 - 10, 20)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-                    # Добавляем общую статистику
-                    status_text = "LIVE" if server.processing and server.frame is not None else "NO SIGNAL"
-                    status_color = (0, 255, 0) if server.processing and server.frame is not None else (0, 0, 255)
-
-                    cv2.putText(frame, f'Status: {status_text}', (10, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
-                    cv2.putText(frame, f'Active Visitors: {len(server.active_visitors)}',
-                                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                    cv2.putText(frame, f'Total Detected: {server.visitor_counter}',
-                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                    cv2.putText(frame, f'Frames: {frame_count}',
-                                (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                    # Ресайзим кадр если он слишком большой для веб-стрима
-                    if frame.shape[1] > 1280 or frame.shape[0] > 720:
-                        frame = cv2.resize(frame, (1280, 720))
-
-                    # Кодируем в JPEG
-                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ret:
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                        frame_count += 1
-                    else:
-                        print("Failed to encode frame")
-
-                    time.sleep(0.033)  # ~30 FPS для стрима
-
-                except Exception as e:
-                    print(f"Error generating stream: {e}")
-                    time.sleep(1)
-
-        return Response(generate(),
-                        mimetype='multipart/x-mixed-replace; boundary=frame',
-                        headers={
-                            'Cache-Control': 'no-cache, no-store, must-revalidate',
-                            'Pragma': 'no-cache',
-                            'Expires': '0'
-                        })
-
-
-class Visitors(Resource):
-    def get(self):
-        """Получение списка посетителей"""
-        try:
-            page = request.args.get('page', 1, type=int)
-            per_page = request.args.get('per_page', 20, type=int)
-
-            with server.app.app_context():
-                visitors = Visitor.query.order_by(Visitor.last_seen.desc()).paginate(
-                    page=page, per_page=per_page, error_out=False)
-
-                result = {
-                    'visitors': [{
-                        'id': v.id,
-                        'track_id': v.track_id,
-                        'first_seen': v.first_seen.isoformat(),
-                        'last_seen': v.last_seen.isoformat(),
-                        'visit_count': v.visit_count,
-                        'is_active': v.is_active
-                    } for v in visitors.items],
-                    'total': visitors.total,
-                    'pages': visitors.pages,
-                    'current_page': page
-                }
-
-                return result, 200
-
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-
-class Reports(Resource):
-    def post(self):
-        """Генерация отчета"""
-        try:
-            data = request.get_json()
-            if not data:
-                return {'error': 'No JSON data provided'}, 400
-
-            report_type = data.get('report_type')
-            start_date_str = data.get('start_date')
-            end_date_str = data.get('end_date')
-
-            if not report_type or not start_date_str or not end_date_str:
-                return {'error': 'Missing required fields: report_type, start_date, end_date'}, 400
-
-            start_date = datetime.fromisoformat(start_date_str)
-            end_date = datetime.fromisoformat(end_date_str)
-
-            report_id = server.generate_report(report_type, start_date, end_date)
-
-            return {'report_id': report_id, 'message': 'Report generated successfully'}, 200
-
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-    def get(self):
-        """Получение отчетов"""
-        try:
-            with server.app.app_context():
-                reports = Report.query.order_by(Report.generated_at.desc()).all()
-
-                result = [{
-                    'id': r.id,
-                    'report_type': r.report_type,
-                    'generated_at': r.generated_at.isoformat(),
-                    'data': json.loads(r.data) if r.data else {}
-                } for r in reports]
-
-                return result, 200
-
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-
-class Statistics(Resource):
-    def get(self):
-        """Получение статистики"""
-        try:
-            with server.app.app_context():
-                total_visitors = Visitor.query.count()
-                active_visitors = Visitor.query.filter_by(is_active=True).count()
-                today_visitors = Visitor.query.filter(
-                    Visitor.first_seen >= datetime.now().date()
-                ).count()
-
-                return {
-                    'total_visitors': total_visitors,
-                    'active_visitors': active_visitors,
-                    'today_visitors': today_visitors,
-                    'currently_tracking': len(server.active_visitors),
-                    'processing_status': server.processing,
-                    'rtsp_stream': server.rtsp_url,
-                    'server_uptime': str(datetime.now() - server_start_time),
-                    'stream_info': server.get_stream_info(),
-                    'frames_processed': server.frames_processed,
-                    'frames_read': server.frames_read
-                }, 200
-
-        except Exception as e:
-            return {'error': str(e)}, 500
+# Создаем Flask app и SocketIO
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'video-analytics-secret'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+api = Api(app)
 
 
 class VideoAnalyticsServer:
     def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
-        self.app = Flask(__name__)
-        self.api = Api(self.app)
-        self.setup_database()
-        self.setup_routes()
-
-        # RTSP URL
+        self.app = app
+        self.socketio = socketio
+        self.api = api
         self.rtsp_url = rtsp_url
         self.backend_name = "Unknown"
 
@@ -246,6 +48,7 @@ class VideoAnalyticsServer:
         self.processing = False
         self.stream_thread = None
         self.process_thread = None
+        self.websocket_thread = None
         self.frame_lock = threading.Lock()
         self.stream_info = {}
 
@@ -255,9 +58,14 @@ class VideoAnalyticsServer:
         self.last_processed = None
         self.frames_processed = 0
         self.frames_read = 0
+        self.clients_connected = 0
 
         # Тестовый кадр если RTSP не работает
         self.test_frame = self._create_test_frame()
+
+        self.setup_database()
+        self.setup_routes()
+        self.setup_socketio_events()
 
         print("Video Analytics Server initialized successfully")
         print(f"RTSP URL: {rtsp_url}")
@@ -274,7 +82,6 @@ class VideoAnalyticsServer:
         return frame
 
     def get_stream_info(self):
-        """Получение информации о потоке"""
         return self.stream_info
 
     def setup_database(self):
@@ -286,6 +93,20 @@ class VideoAnalyticsServer:
         with self.app.app_context():
             db.create_all()
 
+    def setup_socketio_events(self):
+        """Настройка WebSocket событий"""
+
+        @self.socketio.on('connect')
+        def handle_connect():
+            self.clients_connected += 1
+            print(f'Client connected. Total clients: {self.clients_connected}')
+            emit('status', {'message': 'Connected to video stream', 'clients': self.clients_connected})
+
+        @self.socketio.on('disconnect')
+        def handle_disconnect():
+            self.clients_connected -= 1
+            print(f'Client disconnected. Total clients: {self.clients_connected}')
+
     def setup_routes(self):
         """Настройка API маршрутов"""
 
@@ -293,116 +114,177 @@ class VideoAnalyticsServer:
         @self.app.route('/')
         def index():
             return '''
+            <!DOCTYPE html>
             <html>
-                <head>
-                    <title>Video Analytics Server</title>
-                    <meta charset="utf-8">
-                    <style>
-                        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
-                        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-                        .video-container { text-align: center; margin: 20px 0; background: #000; padding: 10px; border-radius: 5px; }
-                        .video-frame { max-width: 100%; height: auto; border: 2px solid #333; }
-                        .stats { background: #e8f4fd; padding: 15px; border-radius: 5px; margin: 15px 0; }
-                        .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #007cba; }
-                        code { background: #eee; padding: 2px 5px; border-radius: 3px; }
-                        .status-live { color: green; font-weight: bold; }
-                        .status-off { color: red; font-weight: bold; }
-                        .log { background: #f9f9f9; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
-                    </style>
-                    <script>
-                        function updateStatus() {
-                            fetch('/api/status')
-                                .then(response => response.json())
-                                .then(data => {
-                                    // Обновляем статус
-                                    const statusElement = document.getElementById('status');
-                                    if (data.processing && data.frame_available) {
-                                        statusElement.innerHTML = '<span class="status-live">🔴 LIVE</span>';
-                                        statusElement.className = 'status-live';
-                                    } else {
-                                        statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
-                                        statusElement.className = 'status-off';
-                                    }
+            <head>
+                <title>Video Analytics Server</title>
+                <meta charset="utf-8">
+                <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+                    .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                    .video-container { text-align: center; margin: 20px 0; background: #000; padding: 10px; border-radius: 5px; }
+                    .video-frame { max-width: 100%; height: auto; border: 2px solid #333; }
+                    .stats { background: #e8f4fd; padding: 15px; border-radius: 5px; margin: 15px 0; }
+                    .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #007cba; }
+                    code { background: #eee; padding: 2px 5px; border-radius: 3px; }
+                    .status-live { color: green; font-weight: bold; }
+                    .status-off { color: red; font-weight: bold; }
+                    .log { background: #f9f9f9; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
+                    .controls { margin: 10px 0; }
+                    button { padding: 10px 15px; margin: 5px; background: #007cba; color: white; border: none; border-radius: 5px; cursor: pointer; }
+                    button:hover { background: #005a87; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🎥 Video Analytics Server</h1>
+                    <p>Сервер видеоаналитики на YOLO + DeepSORT для NVIDIA T400</p>
 
-                                    // Обновляем статистику
-                                    document.getElementById('visitors').textContent = data.active_visitors;
-                                    document.getElementById('total').textContent = data.total_visitors;
-                                    document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
-                                    document.getElementById('frames').textContent = data.frames_processed || 0;
-                                    document.getElementById('backend').textContent = data.backend || 'Unknown';
+                    <div class="controls">
+                        <button onclick="startStream()">▶️ Start Stream</button>
+                        <button onclick="stopStream()">⏹️ Stop Stream</button>
+                        <button onclick="getSnapshot()">📸 Snapshot</button>
+                    </div>
 
-                                    if(data.stream_info) {
-                                        document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
-                                        document.getElementById('fps').textContent = data.stream_info.fps || 'N/A';
-                                    }
+                    <div class="stats">
+                        <h3>📊 Текущая статистика:</h3>
+                        <p><strong>Статус:</strong> <span id="status">Loading...</span></p>
+                        <p><strong>Активные посетители:</strong> <span id="visitors">0</span></p>
+                        <p><strong>Всего обнаружено:</strong> <span id="total">0</span></p>
+                        <p><strong>Кадр доступен:</strong> <span id="frame">No</span></p>
+                        <p><strong>Обработано кадров:</strong> <span id="frames">0</span></p>
+                        <p><strong>Подключенные клиенты:</strong> <span id="clients">0</span></p>
+                        <p><strong>Бэкенд:</strong> <span id="backend">Unknown</span></p>
+                        <p><strong>Разрешение:</strong> <span id="resolution">N/A</span></p>
+                        <p><strong>FPS:</strong> <span id="fps">N/A</span></p>
+                        <p><strong>RTSP URL:</strong> <code>rtsp://admin:admin@10.0.0.242:554/live/main</code></p>
+                    </div>
 
-                                    // Обновляем лог
-                                    const logElement = document.getElementById('log');
-                                    const newLog = `[${new Date().toLocaleTimeString()}] Status: ${data.processing ? 'Processing' : 'Stopped'}, Frames: ${data.frames_processed}, Visitors: ${data.active_visitors}\\n` + logElement.textContent;
-                                    logElement.textContent = newLog.substring(0, 1000);
-                                })
-                                .catch(error => {
-                                    console.error('Error fetching status:', error);
-                                });
+                    <div class="video-container">
+                        <h3>📹 Live Video Stream (WebSocket):</h3>
+                        <img id="videoStream" class="video-frame" width="1280" height="720" alt="Video Stream">
+                        <div id="streamStatus"></div>
+                    </div>
+
+                    <div class="log-container">
+                        <h3>📋 Лог системы:</h3>
+                        <div class="log" id="log">Запуск системы...</div>
+                    </div>
+
+                    <h2>🔧 Доступные endpoints:</h2>
+                    <div class="endpoint">
+                        <strong>GET /api/status</strong> - Статус сервера
+                    </div>
+                    <div class="endpoint">
+                        <strong>GET /api/snapshot</strong> - Текущий снимок
+                    </div>
+                    <div class="endpoint">
+                        <strong>GET /api/visitors</strong> - Список посетителей
+                    </div>
+                    <div class="endpoint">
+                        <strong>GET /api/statistics</strong> - Статистика
+                    </div>
+                </div>
+
+                <script>
+                    const socket = io();
+                    let streamActive = false;
+                    let frameCount = 0;
+
+                    // WebSocket события
+                    socket.on('connect', function(data) {
+                        addLog('WebSocket connected');
+                        document.getElementById('clients').textContent = data.clients || 1;
+                    });
+
+                    socket.on('disconnect', function() {
+                        addLog('WebSocket disconnected');
+                    });
+
+                    socket.on('status', function(data) {
+                        addLog('Status: ' + data.message);
+                        if (data.clients) {
+                            document.getElementById('clients').textContent = data.clients;
+                        }
+                    });
+
+                    socket.on('video_frame', function(data) {
+                        frameCount++;
+                        document.getElementById('videoStream').src = data.image;
+                        document.getElementById('streamStatus').innerHTML = 
+                            `<p>Frames received: ${frameCount}</p>`;
+                    });
+
+                    socket.on('server_status', function(data) {
+                        updateStatusDisplay(data);
+                    });
+
+                    // Функции управления
+                    function startStream() {
+                        socket.emit('start_stream');
+                        addLog('Requested stream start');
+                    }
+
+                    function stopStream() {
+                        socket.emit('stop_stream');
+                        addLog('Requested stream stop');
+                    }
+
+                    function getSnapshot() {
+                        fetch('/api/snapshot')
+                            .then(response => response.blob())
+                            .then(blob => {
+                                const url = URL.createObjectURL(blob);
+                                const img = document.getElementById('videoStream');
+                                img.src = url;
+                                addLog('Snapshot loaded');
+                            })
+                            .catch(error => {
+                                addLog('Error getting snapshot: ' + error);
+                            });
+                    }
+
+                    function updateStatusDisplay(data) {
+                        const statusElement = document.getElementById('status');
+                        if (data.processing && data.frame_available) {
+                            statusElement.innerHTML = '<span class="status-live">🔴 LIVE</span>';
+                        } else {
+                            statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
                         }
 
-                        // Обновляем статус каждые 3 секунды
-                        setInterval(updateStatus, 3000);
-                        document.addEventListener('DOMContentLoaded', updateStatus);
-                    </script>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>🎥 Video Analytics Server</h1>
-                        <p>Сервер видеоаналитики на YOLO + DeepSORT для NVIDIA T400</p>
+                        document.getElementById('visitors').textContent = data.active_visitors;
+                        document.getElementById('total').textContent = data.total_visitors;
+                        document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
+                        document.getElementById('frames').textContent = data.frames_processed || 0;
+                        document.getElementById('backend').textContent = data.backend || 'Unknown';
 
-                        <div class="stats">
-                            <h3>📊 Текущая статистика:</h3>
-                            <p><strong>Статус:</strong> <span id="status">Loading...</span></p>
-                            <p><strong>Активные посетители:</strong> <span id="visitors">0</span></p>
-                            <p><strong>Всего обнаружено:</strong> <span id="total">0</span></p>
-                            <p><strong>Кадр доступен:</strong> <span id="frame">No</span></p>
-                            <p><strong>Обработано кадров:</strong> <span id="frames">0</span></p>
-                            <p><strong>Бэкенд:</strong> <span id="backend">Unknown</span></p>
-                            <p><strong>Разрешение:</strong> <span id="resolution">N/A</span></p>
-                            <p><strong>FPS:</strong> <span id="fps">N/A</span></p>
-                            <p><strong>RTSP URL:</strong> <code>rtsp://admin:admin@10.0.0.242:554/live/main</code></p>
-                        </div>
+                        if(data.stream_info) {
+                            document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
+                            document.getElementById('fps').textContent = data.stream_info.fps || 'N/A';
+                        }
+                    }
 
-                        <div class="video-container">
-                            <h3>📹 Live Video Stream:</h3>
-                            <img src="/api/video_stream" class="video-frame" width="1280" height="720" alt="Video Stream">
-                            <p><a href="/api/video_stream" target="_blank">Открыть в новой вкладке</a></p>
-                        </div>
+                    function addLog(message) {
+                        const logElement = document.getElementById('log');
+                        const newLog = `[${new Date().toLocaleTimeString()}] ${message}\\n` + logElement.textContent;
+                        logElement.textContent = newLog.substring(0, 1000);
+                    }
 
-                        <div class="log-container">
-                            <h3>📋 Лог системы:</h3>
-                            <div class="log" id="log">Запуск системы...</div>
-                        </div>
+                    // Авто-обновление статуса
+                    setInterval(() => {
+                        fetch('/api/status')
+                            .then(response => response.json())
+                            .then(updateStatusDisplay)
+                            .catch(error => console.error('Error fetching status:', error));
+                    }, 3000);
 
-                        <h2>🔧 Доступные endpoints:</h2>
-
-                        <div class="endpoint">
-                            <strong>GET /api/status</strong> - Статус сервера
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/video_control</strong> - Статус видео потока
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/video_stream</strong> - Потоковое видео с детекциями
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/visitors</strong> - Список посетителей
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/statistics</strong> - Статистика
-                        </div>
-                    </div>
-                </body>
+                    // Запускаем стрим при загрузке
+                    window.addEventListener('load', function() {
+                        startStream();
+                    });
+                </script>
+            </body>
             </html>
             '''
 
@@ -420,23 +302,126 @@ class VideoAnalyticsServer:
                 'frame_available': self.frame is not None,
                 'frames_processed': self.frames_processed,
                 'frames_read': self.frames_read,
+                'clients_connected': self.clients_connected,
                 'stream_info': self.stream_info,
                 'backend': self.backend_name
             })
 
+        @self.app.route('/api/snapshot')
+        def snapshot():
+            """Получение одного кадра (для тестирования)"""
+            try:
+                frame = self.get_current_frame()
+
+                # Добавляем информацию о статусе
+                status_text = "LIVE" if self.processing and self.frame is not None else "NO SIGNAL"
+                status_color = (0, 255, 0) if self.processing and self.frame is not None else (0, 0, 255)
+
+                cv2.putText(frame, f'Status: {status_text}', (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
+                cv2.putText(frame, f'Visitors: {len(self.active_visitors)}', (10, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                cv2.putText(frame, f'Frames: {self.frames_processed}', (10, 110),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                # Ресайзим если нужно
+                if frame.shape[1] > 1280 or frame.shape[0] > 720:
+                    frame = cv2.resize(frame, (1280, 720))
+
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ret:
+                    response = Response(buffer.tobytes(), mimetype='image/jpeg')
+                    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+                    response.headers['Pragma'] = 'no-cache'
+                    response.headers['Expires'] = '0'
+                    return response
+                else:
+                    return "Error encoding image", 500
+            except Exception as e:
+                return f"Error: {e}", 500
+
+        # WebSocket обработчики
+        @self.socketio.on('start_stream')
+        def handle_start_stream():
+            print("WebSocket: Start stream requested")
+            if not self.websocket_thread or not self.websocket_thread.is_alive():
+                self.websocket_thread = threading.Thread(target=self._websocket_stream, daemon=True)
+                self.websocket_thread.start()
+                emit('status', {'message': 'WebSocket stream started'})
+
+        @self.socketio.on('stop_stream')
+        def handle_stop_stream():
+            print("WebSocket: Stop stream requested")
+            # Флаг остановки будет обработан в потоке
+            emit('status', {'message': 'WebSocket stream stop requested'})
+
         # Регистрируем API ресурсы
-        self.api.add_resource(VideoControl, '/api/video_control')
-        self.api.add_resource(VideoStream, '/api/video_stream')
         self.api.add_resource(Visitors, '/api/visitors')
         self.api.add_resource(Reports, '/api/reports')
         self.api.add_resource(Statistics, '/api/statistics')
+
+    def _websocket_stream(self):
+        """Поток для отправки кадров через WebSocket"""
+        print("WebSocket stream thread started")
+        frame_count = 0
+
+        while self.clients_connected > 0:
+            try:
+                frame = self.get_current_frame()
+
+                # Добавляем детекции если есть
+                if self.processing and self.frame is not None:
+                    tracks = self.process_frame(frame)
+
+                    # Рисуем bounding boxes и ID
+                    for track_id, track in tracks.items():
+                        x, y, w, h = track['bbox']
+                        x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        cv2.putText(frame, f'ID: {track_id}', (x1, max(y1 - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # Добавляем статистику
+                status_text = "LIVE" if self.processing and self.frame is not None else "NO SIGNAL"
+                status_color = (0, 255, 0) if self.processing and self.frame is not None else (0, 0, 255)
+
+                cv2.putText(frame, f'Status: {status_text}', (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
+                cv2.putText(frame, f'Visitors: {len(self.active_visitors)}', (10, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                cv2.putText(frame, f'Frames: {frame_count}', (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                # Ресайзим если нужно
+                if frame.shape[1] > 1280 or frame.shape[0] > 720:
+                    frame = cv2.resize(frame, (1280, 720))
+
+                # Кодируем в base64
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ret:
+                    img_base64 = base64.b64encode(buffer).decode('utf-8')
+                    self.socketio.emit('video_frame', {
+                        'image': f'data:image/jpeg;base64,{img_base64}',
+                        'frame_count': frame_count,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    frame_count += 1
+
+                time.sleep(0.033)  # ~30 FPS
+
+            except Exception as e:
+                print(f"WebSocket stream error: {e}")
+                time.sleep(1)
+
+        print("WebSocket stream thread stopped")
 
     def start_video_stream(self):
         """Запуск RTSP потока"""
         try:
             print(f"Connecting to RTSP stream: {self.rtsp_url}")
 
-            # Пробуем разные бэкенды в порядке приоритета
+            # Пробуем разные бэкенды
             backends = [
                 (cv2.CAP_FFMPEG, "FFMPEG"),
                 (cv2.CAP_ANY, "ANY")
@@ -446,7 +431,6 @@ class VideoAnalyticsServer:
                 print(f"Trying {name} backend...")
                 self.cap = cv2.VideoCapture(self.rtsp_url, backend)
 
-                # Добавляем параметры для RTSP
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 self.cap.set(cv2.CAP_PROP_FPS, 15)
 
@@ -454,7 +438,6 @@ class VideoAnalyticsServer:
                     self.backend_name = name
                     print(f"{name} backend opened successfully")
 
-                    # Даем время на инициализацию
                     time.sleep(2)
 
                     # Пробуем прочитать первый кадр
@@ -517,7 +500,7 @@ class VideoAnalyticsServer:
                     success_count += 1
                     self.frames_read += 1
 
-                    if success_count % 30 == 0:  # Логируем каждые 30 кадров
+                    if success_count % 30 == 0:
                         print(f"Read {success_count} frames from RTSP stream")
 
                 else:
@@ -549,12 +532,11 @@ class VideoAnalyticsServer:
                         current_frame = self.frame.copy()
 
                 if current_frame is not None:
-                    # Обработка кадра
                     self.process_frame(current_frame)
                     self.last_processed = datetime.now()
                     self.frames_processed += 1
 
-                time.sleep(0.067)  # ~15 FPS для обработки
+                time.sleep(0.067)
 
             except Exception as e:
                 print(f"Error in processing loop: {e}")
@@ -574,7 +556,7 @@ class VideoAnalyticsServer:
         print("Video stream stopped")
 
     def get_current_frame(self):
-        """Получение текущего кадра с блокировкой"""
+        """Получение текущего кадра"""
         with self.frame_lock:
             if self.frame is not None:
                 return self.frame.copy()
@@ -584,27 +566,20 @@ class VideoAnalyticsServer:
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""
         try:
-            # Детекция лиц и одежды
             face_detections, clothing_detections = self.detector.detect_face_and_clothing(frame)
-
-            # Объединяем все детекции
             all_detections = face_detections + clothing_detections
 
-            # Конвертация в формат DeepSORT
             deepsort_detections = []
             for det in all_detections:
                 bbox = det['bbox']
                 confidence = det['confidence']
                 feature = det['feature']
-
                 deepsort_det = DeepSortDetection(bbox, confidence, feature)
                 deepsort_detections.append(deepsort_det)
 
-            # Обновление трекера
             self.tracker.predict()
             self.tracker.update(deepsort_detections)
 
-            # Обработка треков
             current_tracks = {}
             for track in self.tracker.tracks:
                 if not track.is_confirmed():
@@ -614,8 +589,6 @@ class VideoAnalyticsServer:
                 bbox = track.mean[:4].copy()
                 bbox[2] *= bbox[3]
                 bbox[:2] -= bbox[2:] / 2
-
-                # Убедимся, что координаты валидны
                 bbox = [max(0, float(coord)) for coord in bbox]
 
                 current_tracks[track_id] = {
@@ -624,13 +597,10 @@ class VideoAnalyticsServer:
                     'confidence': getattr(track, 'confidence', 1.0)
                 }
 
-                # Обновление/создание посетителя в БД (только для новых треков)
                 if track_id not in self.active_visitors:
                     self.update_visitor(track_id, bbox, frame)
 
-            # Обновление активных посетителей
             self.update_active_visitors(current_tracks)
-
             return current_tracks
 
         except Exception as e:
@@ -642,15 +612,12 @@ class VideoAnalyticsServer:
         try:
             with self.app.app_context():
                 visitor = Visitor.query.filter_by(track_id=track_id).first()
-
                 now = datetime.utcnow()
 
                 if not visitor:
-                    # Новый посетитель
                     visitor = Visitor(track_id=track_id, first_seen=now, last_seen=now)
                     db.session.add(visitor)
                     db.session.commit()
-
                     self.visitor_counter += 1
                     print(f"New visitor created: track_id={track_id}")
 
@@ -664,7 +631,6 @@ class VideoAnalyticsServer:
         current_ids = set(current_tracks.keys())
         previous_ids = set(self.active_visitors.keys())
 
-        # Новые посетители
         new_visitors = current_ids - previous_ids
         for track_id in new_visitors:
             self.active_visitors[track_id] = {
@@ -672,12 +638,10 @@ class VideoAnalyticsServer:
                 'last_seen': datetime.utcnow()
             }
 
-        # Обновление времени последнего визита
         for track_id in current_ids:
             if track_id in self.active_visitors:
                 self.active_visitors[track_id]['last_seen'] = datetime.utcnow()
 
-        # Удаление неактивных посетителей
         inactive_timeout = timedelta(minutes=5)
         now = datetime.utcnow()
         inactive_visitors = []
@@ -716,13 +680,112 @@ class VideoAnalyticsServer:
 
     def run(self, host='0.0.0.0', port=5000):
         """Запуск сервера"""
-        # Автоматически запускаем RTSP поток при старте
         print("Attempting to start RTSP stream...")
         if not self.start_video_stream():
             print("Warning: Could not start RTSP stream. Server will run with test frame.")
 
         print(f"Starting Video Analytics Server on {host}:{port}")
-        self.app.run(host=host, port=port, debug=False)
+        self.socketio.run(self.app, host=host, port=port, debug=False)
+
+
+# Классы API Resources (Visitors, Reports, Statistics) остаются без изменений
+class Visitors(Resource):
+    def get(self):
+        try:
+            page = request.args.get('page', 1, type=int)
+            per_page = request.args.get('per_page', 20, type=int)
+
+            with app.app_context():
+                visitors = Visitor.query.order_by(Visitor.last_seen.desc()).paginate(
+                    page=page, per_page=per_page, error_out=False)
+
+                result = {
+                    'visitors': [{
+                        'id': v.id,
+                        'track_id': v.track_id,
+                        'first_seen': v.first_seen.isoformat(),
+                        'last_seen': v.last_seen.isoformat(),
+                        'visit_count': v.visit_count,
+                        'is_active': v.is_active
+                    } for v in visitors.items],
+                    'total': visitors.total,
+                    'pages': visitors.pages,
+                    'current_page': page
+                }
+
+                return result, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class Reports(Resource):
+    def post(self):
+        try:
+            data = request.get_json()
+            if not data:
+                return {'error': 'No JSON data provided'}, 400
+
+            report_type = data.get('report_type')
+            start_date_str = data.get('start_date')
+            end_date_str = data.get('end_date')
+
+            if not report_type or not start_date_str or not end_date_str:
+                return {'error': 'Missing required fields: report_type, start_date, end_date'}, 400
+
+            start_date = datetime.fromisoformat(start_date_str)
+            end_date = datetime.fromisoformat(end_date_str)
+
+            report_id = server.generate_report(report_type, start_date, end_date)
+
+            return {'report_id': report_id, 'message': 'Report generated successfully'}, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+    def get(self):
+        try:
+            with app.app_context():
+                reports = Report.query.order_by(Report.generated_at.desc()).all()
+
+                result = [{
+                    'id': r.id,
+                    'report_type': r.report_type,
+                    'generated_at': r.generated_at.isoformat(),
+                    'data': json.loads(r.data) if r.data else {}
+                } for r in reports]
+
+                return result, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
+
+
+class Statistics(Resource):
+    def get(self):
+        try:
+            with app.app_context():
+                total_visitors = Visitor.query.count()
+                active_visitors = Visitor.query.filter_by(is_active=True).count()
+                today_visitors = Visitor.query.filter(
+                    Visitor.first_seen >= datetime.now().date()
+                ).count()
+
+                return {
+                    'total_visitors': total_visitors,
+                    'active_visitors': active_visitors,
+                    'today_visitors': today_visitors,
+                    'currently_tracking': len(server.active_visitors),
+                    'processing_status': server.processing,
+                    'rtsp_stream': server.rtsp_url,
+                    'server_uptime': str(datetime.now() - server_start_time),
+                    'stream_info': server.get_stream_info(),
+                    'frames_processed': server.frames_processed,
+                    'frames_read': server.frames_read
+                }, 200
+
+        except Exception as e:
+            return {'error': str(e)}, 500
 
 
 # Глобальный экземпляр сервера
