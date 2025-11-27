@@ -31,11 +31,12 @@ def main():
     print(f"Server starting on http://{args.host}:{args.port}")
     print(f"RTSP stream: {args.rtsp}")
     print("Available endpoints:")
-    print("  GET /api/visitors - List visitors")
-    print("  GET /api/statistics - Get statistics")
-    print("  GET /api/reports - Get reports")
-    print("  POST /api/reports - Generate report")
+    print("  GET / - Main page with video stream")
+    print("  GET /api/status - Server status")
+    print("  GET /api/video_control - Video stream status")
     print("  GET /api/video_stream - Live video stream with detections")
+    print("  GET /api/visitors - List visitors")
+    print("  GET /api/statistics - Statistics")
 
     server.run(host=args.host, port=args.port)
 

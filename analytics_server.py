@@ -10,9 +10,9 @@ import threading
 import time
 import os
 
-# Отключаем GUI бэкенд для OpenCV
+# Настройки для OpenCV
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
-os.environ['OPENCV_VIDEOIO_PRIORITY_FFMPEG'] = '1'
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
 
 from models import db, Visitor, Detection, Appearance, Report
 from yolo_detector import FaceClothingDetector
@@ -31,34 +31,12 @@ class VideoControl(Resource):
                 'total_visitors': server.visitor_counter,
                 'last_processed': server.last_processed.isoformat() if server.last_processed else None,
                 'frame_available': server.frame is not None,
-                'stream_info': server.get_stream_info()
+                'stream_info': server.get_stream_info(),
+                'backend': server.backend_name,
+                'frames_processed': server.frames_processed,
+                'frames_read': server.frames_read
             }
             return status, 200
-        except Exception as e:
-            return {'error': str(e)}, 500
-
-    def post(self):
-        """Управление видео потоком"""
-        try:
-            data = request.get_json()
-            if not data:
-                return {'error': 'No JSON data provided'}, 400
-
-            action = data.get('action')
-
-            if action == 'start':
-                if server.start_video_stream():
-                    return {'message': 'Video stream started'}, 200
-                else:
-                    return {'error': 'Failed to start video stream'}, 400
-
-            elif action == 'stop':
-                server.stop_video_stream()
-                return {'message': 'Video stream stopped'}, 200
-
-            else:
-                return {'error': 'Invalid action. Use "start" or "stop"'}, 400
-
         except Exception as e:
             return {'error': str(e)}, 500
 
@@ -69,15 +47,19 @@ class VideoStream(Resource):
 
         def generate():
             frame_count = 0
+            last_log_time = time.time()
+
             while True:
                 try:
                     # Получаем текущий кадр
                     frame = server.get_current_frame()
 
-                    # Отладочная информация
-                    frame_count += 1
-                    if frame_count % 100 == 0:  # Логируем каждые 100 кадров
-                        print(f"Stream: Sent {frame_count} frames, processing: {server.processing}")
+                    # Логируем каждые 10 секунд
+                    current_time = time.time()
+                    if current_time - last_log_time > 10:
+                        print(
+                            f"Stream: Sent {frame_count} frames, processing: {server.processing}, frame available: {server.frame is not None}")
+                        last_log_time = current_time
 
                     # Если есть активная обработка и реальный кадр, добавляем детекции
                     if server.processing and server.frame is not None:
@@ -92,18 +74,20 @@ class VideoStream(Resource):
                             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
                             # Добавляем ID
-                            cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10),
+                            cv2.putText(frame, f'ID: {track_id}', (x1, max(y1 - 10, 20)),
                                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
                     # Добавляем общую статистику
-                    status_text = "LIVE" if server.processing and server.frame is not None else "TEST/NO SIGNAL"
+                    status_text = "LIVE" if server.processing and server.frame is not None else "NO SIGNAL"
+                    status_color = (0, 255, 0) if server.processing and server.frame is not None else (0, 0, 255)
+
                     cv2.putText(frame, f'Status: {status_text}', (10, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
                     cv2.putText(frame, f'Active Visitors: {len(server.active_visitors)}',
                                 (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                     cv2.putText(frame, f'Total Detected: {server.visitor_counter}',
                                 (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                    cv2.putText(frame, f'Frame: {frame_count}',
+                    cv2.putText(frame, f'Frames: {frame_count}',
                                 (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                     # Ресайзим кадр если он слишком большой для веб-стрима
@@ -111,15 +95,13 @@ class VideoStream(Resource):
                         frame = cv2.resize(frame, (1280, 720))
 
                     # Кодируем в JPEG
-                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                     if ret:
                         yield (b'--frame\r\n'
                                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                        frame_count += 1
                     else:
-                        # Fallback на тестовый кадр
-                        ret, buffer = cv2.imencode('.jpg', server.test_frame)
-                        yield (b'--frame\r\n'
-                               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                        print("Failed to encode frame")
 
                     time.sleep(0.033)  # ~30 FPS для стрима
 
@@ -134,34 +116,6 @@ class VideoStream(Resource):
                             'Pragma': 'no-cache',
                             'Expires': '0'
                         })
-
-
-class ProcessImage(Resource):
-    def post(self):
-        """Обработка единичного изображения"""
-        try:
-            if 'image' not in request.files:
-                return {'error': 'No image file'}, 400
-
-            file = request.files['image']
-            img_bytes = file.read()
-            img_np = np.frombuffer(img_bytes, np.uint8)
-            frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-
-            if frame is None:
-                return {'error': 'Invalid image'}, 400
-
-            # Обработка кадра
-            tracks = server.process_frame(frame)
-
-            return {
-                'tracks': tracks,
-                'visitor_count': len(server.active_visitors),
-                'total_visitors': server.visitor_counter
-            }, 200
-
-        except Exception as e:
-            return {'error': str(e)}, 500
 
 
 class Visitors(Resource):
@@ -258,7 +212,9 @@ class Statistics(Resource):
                     'processing_status': server.processing,
                     'rtsp_stream': server.rtsp_url,
                     'server_uptime': str(datetime.now() - server_start_time),
-                    'stream_info': server.get_stream_info()
+                    'stream_info': server.get_stream_info(),
+                    'frames_processed': server.frames_processed,
+                    'frames_read': server.frames_read
                 }, 200
 
         except Exception as e:
@@ -274,6 +230,7 @@ class VideoAnalyticsServer:
 
         # RTSP URL
         self.rtsp_url = rtsp_url
+        self.backend_name = "Unknown"
 
         # Инициализация детектора и трекера
         print("Initializing FaceClothingDetector...")
@@ -297,6 +254,7 @@ class VideoAnalyticsServer:
         self.visitor_counter = 0
         self.last_processed = None
         self.frames_processed = 0
+        self.frames_read = 0
 
         # Тестовый кадр если RTSP не работает
         self.test_frame = self._create_test_frame()
@@ -307,11 +265,11 @@ class VideoAnalyticsServer:
     def _create_test_frame(self):
         """Создание тестового кадра если RTSP не работает"""
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(frame, "RTSP STREAM NOT AVAILABLE", (50, 200),
+        cv2.putText(frame, "RTSP STREAM NOT AVAILABLE", (30, 200),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, "Check RTSP URL and connection", (30, 240),
+        cv2.putText(frame, "Check RTSP URL and connection", (50, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f"URL: {self.rtsp_url}", (30, 280),
+        cv2.putText(frame, f"URL: {self.rtsp_url}", (80, 280),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         return frame
 
@@ -338,6 +296,7 @@ class VideoAnalyticsServer:
             <html>
                 <head>
                     <title>Video Analytics Server</title>
+                    <meta charset="utf-8">
                     <style>
                         body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
                         .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -348,31 +307,47 @@ class VideoAnalyticsServer:
                         code { background: #eee; padding: 2px 5px; border-radius: 3px; }
                         .status-live { color: green; font-weight: bold; }
                         .status-off { color: red; font-weight: bold; }
+                        .log { background: #f9f9f9; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
                     </style>
                     <script>
                         function updateStatus() {
                             fetch('/api/status')
                                 .then(response => response.json())
                                 .then(data => {
-                                    document.getElementById('status').innerHTML = 
-                                        data.processing && data.frame_available ? 
-                                        '<span class="status-live">LIVE</span>' : 
-                                        '<span class="status-off">OFFLINE</span>';
+                                    // Обновляем статус
+                                    const statusElement = document.getElementById('status');
+                                    if (data.processing && data.frame_available) {
+                                        statusElement.innerHTML = '<span class="status-live">🔴 LIVE</span>';
+                                        statusElement.className = 'status-live';
+                                    } else {
+                                        statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
+                                        statusElement.className = 'status-off';
+                                    }
+
+                                    // Обновляем статистику
                                     document.getElementById('visitors').textContent = data.active_visitors;
                                     document.getElementById('total').textContent = data.total_visitors;
                                     document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
+                                    document.getElementById('frames').textContent = data.frames_processed || 0;
+                                    document.getElementById('backend').textContent = data.backend || 'Unknown';
+
                                     if(data.stream_info) {
                                         document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
                                         document.getElementById('fps').textContent = data.stream_info.fps || 'N/A';
                                     }
+
+                                    // Обновляем лог
+                                    const logElement = document.getElementById('log');
+                                    const newLog = `[${new Date().toLocaleTimeString()}] Status: ${data.processing ? 'Processing' : 'Stopped'}, Frames: ${data.frames_processed}, Visitors: ${data.active_visitors}\\n` + logElement.textContent;
+                                    logElement.textContent = newLog.substring(0, 1000);
                                 })
                                 .catch(error => {
                                     console.error('Error fetching status:', error);
                                 });
                         }
 
-                        // Обновляем статус каждые 5 секунд
-                        setInterval(updateStatus, 5000);
+                        // Обновляем статус каждые 3 секунды
+                        setInterval(updateStatus, 3000);
                         document.addEventListener('DOMContentLoaded', updateStatus);
                     </script>
                 </head>
@@ -387,6 +362,8 @@ class VideoAnalyticsServer:
                             <p><strong>Активные посетители:</strong> <span id="visitors">0</span></p>
                             <p><strong>Всего обнаружено:</strong> <span id="total">0</span></p>
                             <p><strong>Кадр доступен:</strong> <span id="frame">No</span></p>
+                            <p><strong>Обработано кадров:</strong> <span id="frames">0</span></p>
+                            <p><strong>Бэкенд:</strong> <span id="backend">Unknown</span></p>
                             <p><strong>Разрешение:</strong> <span id="resolution">N/A</span></p>
                             <p><strong>FPS:</strong> <span id="fps">N/A</span></p>
                             <p><strong>RTSP URL:</strong> <code>rtsp://admin:admin@10.0.0.242:554/live/main</code></p>
@@ -394,8 +371,13 @@ class VideoAnalyticsServer:
 
                         <div class="video-container">
                             <h3>📹 Live Video Stream:</h3>
-                            <img src="/api/video_stream" class="video-frame" width="1280" height="720" alt="Video Stream" onerror="this.style.display='none'">
+                            <img src="/api/video_stream" class="video-frame" width="1280" height="720" alt="Video Stream">
                             <p><a href="/api/video_stream" target="_blank">Открыть в новой вкладке</a></p>
+                        </div>
+
+                        <div class="log-container">
+                            <h3>📋 Лог системы:</h3>
+                            <div class="log" id="log">Запуск системы...</div>
                         </div>
 
                         <h2>🔧 Доступные endpoints:</h2>
@@ -409,11 +391,6 @@ class VideoAnalyticsServer:
                         </div>
 
                         <div class="endpoint">
-                            <strong>POST /api/video_control</strong> - Управление видео потоком<br>
-                            Body: <code>{"action": "start"}</code> или <code>{"action": "stop"}</code>
-                        </div>
-
-                        <div class="endpoint">
                             <strong>GET /api/video_stream</strong> - Потоковое видео с детекциями
                         </div>
 
@@ -423,10 +400,6 @@ class VideoAnalyticsServer:
 
                         <div class="endpoint">
                             <strong>GET /api/statistics</strong> - Статистика
-                        </div>
-
-                        <div class="endpoint">
-                            <strong>GET /api/reports</strong> - Список отчетов
                         </div>
                     </div>
                 </body>
@@ -446,7 +419,9 @@ class VideoAnalyticsServer:
                 'last_processed': self.last_processed.isoformat() if self.last_processed else None,
                 'frame_available': self.frame is not None,
                 'frames_processed': self.frames_processed,
-                'stream_info': self.stream_info
+                'frames_read': self.frames_read,
+                'stream_info': self.stream_info,
+                'backend': self.backend_name
             })
 
         # Регистрируем API ресурсы
@@ -455,22 +430,46 @@ class VideoAnalyticsServer:
         self.api.add_resource(Visitors, '/api/visitors')
         self.api.add_resource(Reports, '/api/reports')
         self.api.add_resource(Statistics, '/api/statistics')
-        self.api.add_resource(ProcessImage, '/api/process_image')
 
     def start_video_stream(self):
         """Запуск RTSP потока"""
         try:
             print(f"Connecting to RTSP stream: {self.rtsp_url}")
 
-            # Используем FFMPEG бэкенд
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            # Пробуем разные бэкенды в порядке приоритета
+            backends = [
+                (cv2.CAP_FFMPEG, "FFMPEG"),
+                (cv2.CAP_ANY, "ANY")
+            ]
 
-            if not self.cap.isOpened():
-                print("Trying standard backend...")
-                self.cap = cv2.VideoCapture(self.rtsp_url)
+            for backend, name in backends:
+                print(f"Trying {name} backend...")
+                self.cap = cv2.VideoCapture(self.rtsp_url, backend)
 
-            if not self.cap.isOpened():
-                raise Exception(f"Could not open RTSP stream: {self.rtsp_url}")
+                # Добавляем параметры для RTSP
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 15)
+
+                if self.cap.isOpened():
+                    self.backend_name = name
+                    print(f"{name} backend opened successfully")
+
+                    # Даем время на инициализацию
+                    time.sleep(2)
+
+                    # Пробуем прочитать первый кадр
+                    ret, test_frame = self.cap.read()
+                    if ret:
+                        print(f"Successfully read first frame: {test_frame.shape}")
+                        break
+                    else:
+                        print(f"{name} backend opened but cannot read frames")
+                        self.cap.release()
+                else:
+                    print(f"{name} backend failed to open")
+
+            if not self.cap or not self.cap.isOpened():
+                raise Exception("All backends failed to open RTSP stream")
 
             # Получаем информацию о потоке
             width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -480,10 +479,10 @@ class VideoAnalyticsServer:
             self.stream_info = {
                 'resolution': f"{width}x{height}",
                 'fps': fps,
-                'backend': 'FFMPEG' if 'FFMPEG' in str(self.cap.getBackendName()) else 'Standard'
+                'backend': self.backend_name
             }
 
-            print(f"RTSP stream connected successfully: {self.stream_info}")
+            print(f"Stream info: {self.stream_info}")
 
             self.processing = True
 
@@ -495,6 +494,7 @@ class VideoAnalyticsServer:
             self.process_thread = threading.Thread(target=self._processing_loop, daemon=True)
             self.process_thread.start()
 
+            print("Video stream processing started")
             return True
 
         except Exception as e:
@@ -503,58 +503,41 @@ class VideoAnalyticsServer:
 
     def _read_frames(self):
         """Чтение кадров из RTSP потока"""
-        error_count = 0
-        max_errors = 10
+        consecutive_errors = 0
+        max_errors = 5
         success_count = 0
 
-        while self.processing and error_count < max_errors:
+        while self.processing and consecutive_errors < max_errors:
             try:
                 ret, frame = self.cap.read()
                 if ret:
                     with self.frame_lock:
                         self.frame = frame
-                    error_count = 0
+                    consecutive_errors = 0
                     success_count += 1
-                    if success_count % 100 == 0:  # Логируем каждые 100 кадров
-                        print(f"RTSP: Successfully read {success_count} frames")
+                    self.frames_read += 1
+
+                    if success_count % 30 == 0:  # Логируем каждые 30 кадров
+                        print(f"Read {success_count} frames from RTSP stream")
+
                 else:
-                    error_count += 1
-                    print(f"Failed to read frame from RTSP stream ({error_count}/{max_errors})")
-                    if error_count >= max_errors:
+                    consecutive_errors += 1
+                    print(f"Failed to read frame ({consecutive_errors}/{max_errors})")
+
+                    if consecutive_errors >= max_errors:
                         print("Too many consecutive errors, stopping stream...")
                         self.processing = False
                         break
 
-                    # Пробуем переподключиться после нескольких ошибок
-                    if error_count % 3 == 0:
-                        self._reconnect_stream()
-
-                    time.sleep(1)
+                    time.sleep(0.5)
 
             except Exception as e:
-                error_count += 1
+                consecutive_errors += 1
                 print(f"Error reading frame: {e}")
                 time.sleep(1)
 
-    def _reconnect_stream(self):
-        """Переподключение к RTSP потоку"""
-        try:
-            print("Attempting to reconnect to RTSP stream...")
-            if self.cap:
-                self.cap.release()
-
-            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-
-            if not self.cap.isOpened():
-                print("Failed to reconnect to RTSP stream")
-                return False
-
-            print("Successfully reconnected to RTSP stream")
-            return True
-
-        except Exception as e:
-            print(f"Error reconnecting to stream: {e}")
-            return False
+        if consecutive_errors >= max_errors:
+            print("RTSP stream stopped due to errors")
 
     def _processing_loop(self):
         """Основной цикл обработки видео"""
