@@ -22,7 +22,7 @@ from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepS
 # Создаем Flask app и SocketIO
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'video-analytics-secret'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 api = Api(app)
 
 
@@ -49,6 +49,7 @@ class VideoAnalyticsServer:
         self.stream_thread = None
         self.process_thread = None
         self.websocket_thread = None
+        self.websocket_active = False
         self.frame_lock = threading.Lock()
         self.stream_info = {}
 
@@ -102,10 +103,108 @@ class VideoAnalyticsServer:
             print(f'Client connected. Total clients: {self.clients_connected}')
             emit('status', {'message': 'Connected to video stream', 'clients': self.clients_connected})
 
+            # Автоматически запускаем стрим при подключении
+            self._start_websocket_stream()
+
         @self.socketio.on('disconnect')
         def handle_disconnect():
-            self.clients_connected -= 1
+            self.clients_connected = max(0, self.clients_connected - 1)
             print(f'Client disconnected. Total clients: {self.clients_connected}')
+
+        @self.socketio.on('start_stream')
+        def handle_start_stream():
+            print("WebSocket: Start stream requested by client")
+            self._start_websocket_stream()
+
+        @self.socketio.on('stop_stream')
+        def handle_stop_stream():
+            print("WebSocket: Stop stream requested")
+            self.websocket_active = False
+            emit('status', {'message': 'WebSocket stream stopped'})
+
+    def _start_websocket_stream(self):
+        """Запуск WebSocket потока"""
+        if not self.websocket_active:
+            self.websocket_active = True
+            if not self.websocket_thread or not self.websocket_thread.is_alive():
+                self.websocket_thread = threading.Thread(target=self._websocket_stream, daemon=True)
+                self.websocket_thread.start()
+                print("WebSocket stream started")
+                self.socketio.emit('status', {'message': 'WebSocket stream started'})
+
+    def _websocket_stream(self):
+        """Поток для отправки кадров через WebSocket"""
+        print("WebSocket stream thread started")
+        frame_count = 0
+
+        while self.websocket_active and self.clients_connected > 0:
+            try:
+                # Получаем текущий кадр
+                frame = self.get_current_frame()
+
+                # Добавляем детекции если есть реальный кадр
+                if self.processing and self.frame is not None:
+                    try:
+                        tracks = self.process_frame(frame)
+
+                        # Рисуем bounding boxes и ID
+                        for track_id, track in tracks.items():
+                            x, y, w, h = track['bbox']
+                            x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+
+                            # Проверяем границы
+                            if (x1 >= 0 and y1 >= 0 and x2 <= frame.shape[1] and y2 <= frame.shape[0]):
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                                cv2.putText(frame, f'ID: {track_id}', (x1, max(y1 - 10, 20)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    except Exception as e:
+                        print(f"Error drawing detections: {e}")
+
+                # Добавляем статистику
+                status_text = "LIVE" if self.processing and self.frame is not None else "NO SIGNAL"
+                status_color = (0, 255, 0) if self.processing and self.frame is not None else (0, 0, 255)
+
+                cv2.putText(frame, f'Status: {status_text}', (10, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
+                cv2.putText(frame, f'Visitors: {len(self.active_visitors)}', (10, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                cv2.putText(frame, f'Frames: {frame_count}', (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, f'WebSocket Stream', (10, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                # Ресайзим для оптимизации
+                if frame.shape[1] > 800 or frame.shape[0] > 600:
+                    frame = cv2.resize(frame, (800, 600))
+
+                # Кодируем в base64
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+                if ret:
+                    img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+                    # Отправляем через SocketIO
+                    self.socketio.emit('video_frame', {
+                        'image': f'data:image/jpeg;base64,{img_base64}',
+                        'frame_count': frame_count,
+                        'timestamp': datetime.now().isoformat(),
+                        'status': status_text
+                    })
+                    frame_count += 1
+
+                    # Логируем каждые 30 кадров
+                    if frame_count % 30 == 0:
+                        print(f"WebSocket: Sent {frame_count} frames")
+
+                # Пауза для снижения нагрузки (10 FPS)
+                time.sleep(0.1)
+
+            except Exception as e:
+                print(f"WebSocket stream error: {e}")
+                time.sleep(1)
+
+        print("WebSocket stream thread stopped")
+        self.websocket_active = False
 
     def setup_routes(self):
         """Настройка API маршрутов"""
@@ -134,6 +233,9 @@ class VideoAnalyticsServer:
                     .controls { margin: 10px 0; }
                     button { padding: 10px 15px; margin: 5px; background: #007cba; color: white; border: none; border-radius: 5px; cursor: pointer; }
                     button:hover { background: #005a87; }
+                    .connection-status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+                    .connected { background: #d4edda; color: #155724; }
+                    .disconnected { background: #f8d7da; color: #721c24; }
                 </style>
             </head>
             <body>
@@ -141,7 +243,12 @@ class VideoAnalyticsServer:
                     <h1>🎥 Video Analytics Server</h1>
                     <p>Сервер видеоаналитики на YOLO + DeepSORT для NVIDIA T400</p>
 
+                    <div class="connection-status" id="connectionStatus">
+                        <strong>WebSocket Status:</strong> <span id="wsStatus">Disconnected</span>
+                    </div>
+
                     <div class="controls">
+                        <button onclick="connectWebSocket()">🔗 Connect WebSocket</button>
                         <button onclick="startStream()">▶️ Start Stream</button>
                         <button onclick="stopStream()">⏹️ Stop Stream</button>
                         <button onclick="getSnapshot()">📸 Snapshot</button>
@@ -149,7 +256,7 @@ class VideoAnalyticsServer:
 
                     <div class="stats">
                         <h3>📊 Текущая статистика:</h3>
-                        <p><strong>Статус:</strong> <span id="status">Loading...</span></p>
+                        <p><strong>Статус RTSP:</strong> <span id="status">Loading...</span></p>
                         <p><strong>Активные посетители:</strong> <span id="visitors">0</span></p>
                         <p><strong>Всего обнаружено:</strong> <span id="total">0</span></p>
                         <p><strong>Кадр доступен:</strong> <span id="frame">No</span></p>
@@ -162,9 +269,12 @@ class VideoAnalyticsServer:
                     </div>
 
                     <div class="video-container">
-                        <h3>📹 Live Video Stream (WebSocket):</h3>
-                        <img id="videoStream" class="video-frame" width="1280" height="720" alt="Video Stream">
-                        <div id="streamStatus"></div>
+                        <h3>📹 Live Video Stream:</h3>
+                        <img id="videoStream" class="video-frame" width="800" height="600" alt="Video Stream" 
+                             onerror="this.onerror=null; this.src='/api/snapshot';">
+                        <div id="streamInfo">
+                            <p>Waiting for video stream...</p>
+                        </div>
                     </div>
 
                     <div class="log-container">
@@ -189,21 +299,29 @@ class VideoAnalyticsServer:
 
                 <script>
                     const socket = io();
-                    let streamActive = false;
                     let frameCount = 0;
+                    let isConnected = false;
 
                     // WebSocket события
                     socket.on('connect', function(data) {
-                        addLog('WebSocket connected');
-                        document.getElementById('clients').textContent = data.clients || 1;
+                        isConnected = true;
+                        document.getElementById('connectionStatus').className = 'connection-status connected';
+                        document.getElementById('wsStatus').textContent = 'Connected';
+                        addLog('WebSocket connected successfully');
+                        if (data.clients) {
+                            document.getElementById('clients').textContent = data.clients;
+                        }
                     });
 
                     socket.on('disconnect', function() {
+                        isConnected = false;
+                        document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                        document.getElementById('wsStatus').textContent = 'Disconnected';
                         addLog('WebSocket disconnected');
                     });
 
                     socket.on('status', function(data) {
-                        addLog('Status: ' + data.message);
+                        addLog('Server: ' + data.message);
                         if (data.clients) {
                             document.getElementById('clients').textContent = data.clients;
                         }
@@ -211,38 +329,45 @@ class VideoAnalyticsServer:
 
                     socket.on('video_frame', function(data) {
                         frameCount++;
-                        document.getElementById('videoStream').src = data.image;
-                        document.getElementById('streamStatus').innerHTML = 
-                            `<p>Frames received: ${frameCount}</p>`;
-                    });
-
-                    socket.on('server_status', function(data) {
-                        updateStatusDisplay(data);
+                        const videoElement = document.getElementById('videoStream');
+                        videoElement.src = data.image;
+                        document.getElementById('streamInfo').innerHTML = 
+                            `<p>Frames received: ${frameCount}, Status: ${data.status}, Last update: ${new Date().toLocaleTimeString()}</p>`;
                     });
 
                     // Функции управления
+                    function connectWebSocket() {
+                        if (!isConnected) {
+                            socket.connect();
+                            addLog('Manual WebSocket connection requested');
+                        } else {
+                            addLog('WebSocket already connected');
+                        }
+                    }
+
                     function startStream() {
-                        socket.emit('start_stream');
-                        addLog('Requested stream start');
+                        if (isConnected) {
+                            socket.emit('start_stream');
+                            addLog('Stream start requested');
+                        } else {
+                            addLog('Error: WebSocket not connected');
+                        }
                     }
 
                     function stopStream() {
-                        socket.emit('stop_stream');
-                        addLog('Requested stream stop');
+                        if (isConnected) {
+                            socket.emit('stop_stream');
+                            addLog('Stream stop requested');
+                        } else {
+                            addLog('Error: WebSocket not connected');
+                        }
                     }
 
                     function getSnapshot() {
-                        fetch('/api/snapshot')
-                            .then(response => response.blob())
-                            .then(blob => {
-                                const url = URL.createObjectURL(blob);
-                                const img = document.getElementById('videoStream');
-                                img.src = url;
-                                addLog('Snapshot loaded');
-                            })
-                            .catch(error => {
-                                addLog('Error getting snapshot: ' + error);
-                            });
+                        const timestamp = new Date().getTime();
+                        const videoElement = document.getElementById('videoStream');
+                        videoElement.src = '/api/snapshot?' + timestamp;
+                        addLog('Snapshot loaded');
                     }
 
                     function updateStatusDisplay(data) {
@@ -279,9 +404,10 @@ class VideoAnalyticsServer:
                             .catch(error => console.error('Error fetching status:', error));
                     }, 3000);
 
-                    // Запускаем стрим при загрузке
+                    // Запускаем при загрузке
                     window.addEventListener('load', function() {
-                        startStream();
+                        addLog('Page loaded, auto-connecting WebSocket...');
+                        // WebSocket автоматически подключится через библиотеку
                     });
                 </script>
             </body>
@@ -303,6 +429,7 @@ class VideoAnalyticsServer:
                 'frames_processed': self.frames_processed,
                 'frames_read': self.frames_read,
                 'clients_connected': self.clients_connected,
+                'websocket_active': self.websocket_active,
                 'stream_info': self.stream_info,
                 'backend': self.backend_name
             })
@@ -323,10 +450,12 @@ class VideoAnalyticsServer:
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                 cv2.putText(frame, f'Frames: {self.frames_processed}', (10, 110),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, 'Snapshot', (10, 150),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                 # Ресайзим если нужно
-                if frame.shape[1] > 1280 or frame.shape[0] > 720:
-                    frame = cv2.resize(frame, (1280, 720))
+                if frame.shape[1] > 800 or frame.shape[0] > 600:
+                    frame = cv2.resize(frame, (800, 600))
 
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if ret:
@@ -340,81 +469,10 @@ class VideoAnalyticsServer:
             except Exception as e:
                 return f"Error: {e}", 500
 
-        # WebSocket обработчики
-        @self.socketio.on('start_stream')
-        def handle_start_stream():
-            print("WebSocket: Start stream requested")
-            if not self.websocket_thread or not self.websocket_thread.is_alive():
-                self.websocket_thread = threading.Thread(target=self._websocket_stream, daemon=True)
-                self.websocket_thread.start()
-                emit('status', {'message': 'WebSocket stream started'})
-
-        @self.socketio.on('stop_stream')
-        def handle_stop_stream():
-            print("WebSocket: Stop stream requested")
-            # Флаг остановки будет обработан в потоке
-            emit('status', {'message': 'WebSocket stream stop requested'})
-
         # Регистрируем API ресурсы
         self.api.add_resource(Visitors, '/api/visitors')
         self.api.add_resource(Reports, '/api/reports')
         self.api.add_resource(Statistics, '/api/statistics')
-
-    def _websocket_stream(self):
-        """Поток для отправки кадров через WebSocket"""
-        print("WebSocket stream thread started")
-        frame_count = 0
-
-        while self.clients_connected > 0:
-            try:
-                frame = self.get_current_frame()
-
-                # Добавляем детекции если есть
-                if self.processing and self.frame is not None:
-                    tracks = self.process_frame(frame)
-
-                    # Рисуем bounding boxes и ID
-                    for track_id, track in tracks.items():
-                        x, y, w, h = track['bbox']
-                        x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
-
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                        cv2.putText(frame, f'ID: {track_id}', (x1, max(y1 - 10, 20)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-                # Добавляем статистику
-                status_text = "LIVE" if self.processing and self.frame is not None else "NO SIGNAL"
-                status_color = (0, 255, 0) if self.processing and self.frame is not None else (0, 0, 255)
-
-                cv2.putText(frame, f'Status: {status_text}', (10, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
-                cv2.putText(frame, f'Visitors: {len(self.active_visitors)}', (10, 80),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv2.putText(frame, f'Frames: {frame_count}', (10, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                # Ресайзим если нужно
-                if frame.shape[1] > 1280 or frame.shape[0] > 720:
-                    frame = cv2.resize(frame, (1280, 720))
-
-                # Кодируем в base64
-                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ret:
-                    img_base64 = base64.b64encode(buffer).decode('utf-8')
-                    self.socketio.emit('video_frame', {
-                        'image': f'data:image/jpeg;base64,{img_base64}',
-                        'frame_count': frame_count,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    frame_count += 1
-
-                time.sleep(0.033)  # ~30 FPS
-
-            except Exception as e:
-                print(f"WebSocket stream error: {e}")
-                time.sleep(1)
-
-        print("WebSocket stream thread stopped")
 
     def start_video_stream(self):
         """Запуск RTSP потока"""
@@ -536,7 +594,7 @@ class VideoAnalyticsServer:
                     self.last_processed = datetime.now()
                     self.frames_processed += 1
 
-                time.sleep(0.067)
+                time.sleep(0.067)  # ~15 FPS для обработки
 
             except Exception as e:
                 print(f"Error in processing loop: {e}")
@@ -545,11 +603,14 @@ class VideoAnalyticsServer:
     def stop_video_stream(self):
         """Остановка RTSP потока"""
         self.processing = False
+        self.websocket_active = False
 
         if self.stream_thread:
             self.stream_thread.join(timeout=2.0)
         if self.process_thread:
             self.process_thread.join(timeout=2.0)
+        if self.websocket_thread:
+            self.websocket_thread.join(timeout=2.0)
         if self.cap:
             self.cap.release()
 
@@ -685,10 +746,10 @@ class VideoAnalyticsServer:
             print("Warning: Could not start RTSP stream. Server will run with test frame.")
 
         print(f"Starting Video Analytics Server on {host}:{port}")
-        self.socketio.run(self.app, host=host, port=port, debug=False)
+        self.socketio.run(self.app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
-# Классы API Resources (Visitors, Reports, Statistics) остаются без изменений
+# API Resources классы
 class Visitors(Resource):
     def get(self):
         try:
@@ -781,7 +842,9 @@ class Statistics(Resource):
                     'server_uptime': str(datetime.now() - server_start_time),
                     'stream_info': server.get_stream_info(),
                     'frames_processed': server.frames_processed,
-                    'frames_read': server.frames_read
+                    'frames_read': server.frames_read,
+                    'websocket_active': server.websocket_active,
+                    'clients_connected': server.clients_connected
                 }, 200
 
         except Exception as e:
