@@ -23,7 +23,10 @@ class VideoAnalyticsServer:
         self.setup_routes()
 
         # Инициализация детектора и трекера
+        print("Initializing FaceClothingDetector...")
         self.detector = FaceClothingDetector()
+
+        print("Initializing DeepSORT tracker...")
         self.metric = NearestNeighborDistanceMetric("cosine", 0.2)
         self.tracker = Tracker(self.metric, max_iou_distance=0.7, max_age=70, n_init=3)
 
@@ -31,6 +34,8 @@ class VideoAnalyticsServer:
         self.active_visitors = {}
         self.visitor_counter = 0
         self.processing = False
+
+        print("Video Analytics Server initialized successfully")
 
     def setup_database(self):
         """Настройка базы данных"""
@@ -50,93 +55,119 @@ class VideoAnalyticsServer:
 
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""
-        # Детекция лиц и одежды
-        face_detections, clothing_detections = self.detector.detect_face_and_clothing(frame)
+        try:
+            # Детекция лиц и одежды
+            face_detections, clothing_detections = self.detector.detect_face_and_clothing(frame)
 
-        # Конвертация в формат DeepSORT
-        deepsort_detections = []
-        for det in face_detections + clothing_detections:
-            bbox = det['bbox']
-            confidence = det['confidence']
-            feature = det['feature']
+            # Объединяем все детекции
+            all_detections = face_detections + clothing_detections
 
-            deepsort_det = DeepSortDetection(bbox, confidence, feature)
-            deepsort_detections.append(deepsort_det)
+            # Конвертация в формат DeepSORT
+            deepsort_detections = []
+            for det in all_detections:
+                bbox = det['bbox']
+                confidence = det['confidence']
+                feature = det['feature']
 
-        # Обновление трекера
-        self.tracker.predict()
-        self.tracker.update(deepsort_detections)
+                deepsort_det = DeepSortDetection(bbox, confidence, feature)
+                deepsort_detections.append(deepsort_det)
 
-        # Обработка треков
-        current_tracks = {}
-        for track in self.tracker.tracks:
-            if not track.is_confirmed():
-                continue
+            # Обновление трекера
+            self.tracker.predict()
+            self.tracker.update(deepsort_detections)
 
-            track_id = track.track_id
-            bbox = track.mean[:4].copy()
-            bbox[2] *= bbox[3]
-            bbox[:2] -= bbox[2:] / 2
+            # Обработка треков
+            current_tracks = {}
+            for track in self.tracker.tracks:
+                if not track.is_confirmed():
+                    continue
 
-            current_tracks[track_id] = {
-                'bbox': bbox,
-                'track_id': track_id,
-                'confidence': track.confidence if hasattr(track, 'confidence') else 1.0
-            }
+                track_id = track.track_id
+                bbox = track.mean[:4].copy()
+                bbox[2] *= bbox[3]
+                bbox[:2] -= bbox[2:] / 2
 
-            # Обновление/создание посетителя в БД
-            self.update_visitor(track_id, bbox, frame)
+                # Убедимся, что координаты валидны
+                bbox = [max(0, float(coord)) for coord in bbox]
 
-        # Обновление активных посетителей
-        self.update_active_visitors(current_tracks)
+                current_tracks[track_id] = {
+                    'bbox': bbox,
+                    'track_id': track_id,
+                    'confidence': getattr(track, 'confidence', 1.0)
+                }
 
-        return current_tracks
+                # Обновление/создание посетителя в БД
+                self.update_visitor(track_id, bbox, frame)
+
+            # Обновление активных посетителей
+            self.update_active_visitors(current_tracks)
+
+            return current_tracks
+
+        except Exception as e:
+            print(f"Error in process_frame: {e}")
+            return {}
 
     def update_visitor(self, track_id, bbox, frame):
         """Обновление информации о посетителе"""
-        with self.app.app_context():
-            visitor = Visitor.query.filter_by(track_id=track_id).first()
+        try:
+            with self.app.app_context():
+                visitor = Visitor.query.filter_by(track_id=track_id).first()
 
-            if not visitor:
-                # Новый посетитель
-                visitor = Visitor(track_id=track_id)
-                db.session.add(visitor)
-                db.session.commit()
+                now = datetime.utcnow()
 
-                # Создаем новое появление
-                appearance = Appearance(visitor_id=visitor.id)
-                db.session.add(appearance)
+                if not visitor:
+                    # Новый посетитель
+                    visitor = Visitor(track_id=track_id, first_seen=now, last_seen=now)
+                    db.session.add(visitor)
+                    db.session.commit()
 
-                self.visitor_counter += 1
-            else:
-                # Обновляем время последнего визита
-                visitor.last_seen = datetime.utcnow()
-                visitor.visit_count += 1
-
-                # Обновляем текущее появление
-                appearance = Appearance.query.filter_by(
-                    visitor_id=visitor.id,
-                    end_time=None
-                ).first()
-
-                if not appearance:
-                    appearance = Appearance(visitor_id=visitor.id)
+                    # Создаем новое появление
+                    appearance = Appearance(visitor_id=visitor.id, start_time=now)
                     db.session.add(appearance)
 
-            # Сохраняем детекцию
-            x, y, w, h = bbox
-            crop = frame[int(y):int(y + h), int(x):int(x + w)]
+                    self.visitor_counter += 1
+                    print(f"New visitor created: track_id={track_id}")
+                else:
+                    # Обновляем время последнего визита
+                    visitor.last_seen = now
+                    visitor.visit_count = Visitor.visit_count + 1
 
-            face_detection = Detection(
-                visitor_id=visitor.id,
-                bbox_x=x, bbox_y=y, bbox_w=w, bbox_h=h,
-                confidence=1.0,
-                detection_type='face'
-            )
-            face_detection.set_image(crop)
+                    # Обновляем текущее появление
+                    appearance = Appearance.query.filter_by(
+                        visitor_id=visitor.id,
+                        end_time=None
+                    ).first()
 
-            db.session.add(face_detection)
-            db.session.commit()
+                    if not appearance:
+                        appearance = Appearance(visitor_id=visitor.id, start_time=now)
+                        db.session.add(appearance)
+
+                # Сохраняем детекцию
+                x, y, w, h = bbox
+                x, y, w, h = int(x), int(y), int(w), int(h)
+
+                # Проверяем границы
+                if (x >= 0 and y >= 0 and w > 0 and h > 0 and
+                        x + w <= frame.shape[1] and y + h <= frame.shape[0]):
+
+                    crop = frame[y:y + h, x:x + w]
+
+                    if crop.size > 0:
+                        detection = Detection(
+                            visitor_id=visitor.id,
+                            bbox_x=x, bbox_y=y, bbox_w=w, bbox_h=h,
+                            confidence=1.0,
+                            detection_type='person'
+                        )
+                        detection.set_image(crop)
+                        db.session.add(detection)
+
+                db.session.commit()
+
+        except Exception as e:
+            print(f"Error updating visitor: {e}")
+            db.session.rollback()
 
     def update_active_visitors(self, current_tracks):
         """Обновление списка активных посетителей"""
@@ -217,7 +248,7 @@ class VideoAnalyticsServer:
         self.app.run(host=host, port=port, debug=False)
 
 
-# API Resources
+# API Resources (остаются без изменений)
 class VideoFeed(Resource):
     def post(self):
         """Обработка видео потока"""

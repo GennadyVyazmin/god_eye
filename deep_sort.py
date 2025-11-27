@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 from typing import List, Tuple
 import cv2
+import scipy.linalg  # Добавляем этот импорт
 
 
 class KalmanFilter:
@@ -116,7 +117,7 @@ class Track:
 
 class Detection:
     def __init__(self, tlwh, confidence, feature):
-        self.tlwh = np.asarray(tlwh, dtype=np.float)
+        self.tlwh = np.asarray(tlwh, dtype=np.float64)
         self.confidence = float(confidence)
         self.feature = np.asarray(feature, dtype=np.float32)
 
@@ -143,8 +144,19 @@ class NearestNeighborDistanceMetric:
         self.samples = {}
 
     def _cosine_distance(self, x, y):
-        x = np.asarray(x) / np.linalg.norm(x, axis=1, keepdims=True)
-        y = np.asarray(y) / np.linalg.norm(y, axis=1, keepdims=True)
+        x = np.asarray(x, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+
+        # Нормализация
+        x_norm = np.linalg.norm(x, axis=1, keepdims=True)
+        y_norm = np.linalg.norm(y, axis=1, keepdims=True)
+
+        x_norm[x_norm == 0] = 1e-10
+        y_norm[y_norm == 0] = 1e-10
+
+        x = x / x_norm
+        y = y / y_norm
+
         return 1. - np.dot(x, y.T)
 
     def partial_fit(self, features, targets, active_targets):
@@ -155,10 +167,13 @@ class NearestNeighborDistanceMetric:
         self.samples = {k: self.samples[k] for k in active_targets}
 
     def distance(self, features, targets):
-        cost_matrix = np.zeros((len(features), len(targets)))
+        cost_matrix = np.zeros((len(features), len(targets)), dtype=np.float32)
         for i, feature in enumerate(features):
             for j, target in enumerate(targets):
-                cost_matrix[i, j] = self._metric([feature], self.samples[target])[0]
+                if target in self.samples and len(self.samples[target]) > 0:
+                    cost_matrix[i, j] = self._metric([feature], self.samples[target])[0]
+                else:
+                    cost_matrix[i, j] = 1.0  # Максимальная дистанция
         return cost_matrix
 
 
@@ -177,6 +192,14 @@ class Tracker:
             track.predict(self.kf)
 
     def update(self, detections):
+        if len(detections) == 0:
+            # Нет детекций - помечаем все треки как пропущенные
+            for track in self.tracks:
+                track.mark_missed()
+            # Удаляем помеченные для удаления треки
+            self.tracks = [t for t in self.tracks if not t.is_deleted()]
+            return
+
         # Matching
         matches, unmatched_tracks, unmatched_detections = self._match(detections)
 
@@ -196,7 +219,7 @@ class Tracker:
         self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
     def _match(self, detections):
-        if len(self.tracks) == 0 or len(detections) == 0:
+        if len(self.tracks) == 0:
             return [], [], list(range(len(detections)))
 
         # Split tracks into confirmed and unconfirmed
@@ -228,18 +251,23 @@ class Tracker:
         cost_matrix = self.metric.distance(features, targets)
         cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
 
-        indices = linear_sum_assignment(cost_matrix)
+        try:
+            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+        except Exception as e:
+            print(f"Error in linear assignment: {e}")
+            return [], track_indices, unmatched_detections
+
         matches, unmatched_tracks, unmatched_detections = [], [], []
 
         for col, detection_idx in enumerate(unmatched_detections):
-            if col not in indices[1]:
+            if col not in col_indices:
                 unmatched_detections.append(detection_idx)
 
         for row, track_idx in enumerate(track_indices):
-            if row not in indices[0]:
+            if row not in row_indices:
                 unmatched_tracks.append(track_idx)
 
-        for row, col in zip(indices[0], indices[1]):
+        for row, col in zip(row_indices, col_indices):
             track_idx = track_indices[row]
             detection_idx = unmatched_detections[col]
             if cost_matrix[row, col] > self.metric.matching_threshold:
