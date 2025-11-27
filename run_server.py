@@ -12,8 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description='Video Analytics Server')
     parser.add_argument('--host', default='0.0.0.0', help='Host address')
     parser.add_argument('--port', type=int, default=5000, help='Port number')
-    parser.add_argument('--camera', type=int, default=0, help='Camera index')
-    parser.add_argument('--video', help='Video file path')
+    parser.add_argument('--rtsp', default='rtsp://admin:admin@10.0.0.242:554/live/main', help='RTSP stream URL')
 
     args = parser.parse_args()
 
@@ -27,14 +26,16 @@ def main():
 
     # Запуск сервера
     from analytics_server import VideoAnalyticsServer
-    server = VideoAnalyticsServer()
+    server = VideoAnalyticsServer(rtsp_url=args.rtsp)
 
     print(f"Server starting on http://{args.host}:{args.port}")
+    print(f"RTSP stream: {args.rtsp}")
     print("Available endpoints:")
     print("  GET /api/visitors - List visitors")
     print("  GET /api/statistics - Get statistics")
     print("  GET /api/reports - Get reports")
     print("  POST /api/reports - Generate report")
+    print("  GET /api/video_stream - Live video stream with detections")
 
     server.run(host=args.host, port=args.port)
 
