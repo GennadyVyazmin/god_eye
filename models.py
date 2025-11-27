@@ -1,3 +1,4 @@
+import numpy as np
 from datetime import datetime
 from flask_sqlalchemy import SQLAlchemy
 import base64

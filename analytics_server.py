@@ -39,13 +39,13 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Более мягкие параметры для лучшего трекинга
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.6)  # Средний порог
+        # Упрощенные параметры для лучшей стабильности
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.4)  # Более низкий порог
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.8,  # Увеличили max_iou_distance
-            max_age=30,  # Средний max_age
-            n_init=2  # Минимальный n_init для быстрого подтверждения
+            max_iou_distance=0.7,
+            max_age=20,  # Уменьшили max_age
+            n_init=3  # Увеличили n_init для стабильности
         )
 
         # Видео поток
@@ -481,42 +481,40 @@ class VideoAnalyticsServer:
         self.api.add_resource(Statistics, '/api/statistics')
 
     def start_video_stream(self):
-        """Запуск RTSP потока"""
+        """Запуск RTSP потока с улучшенной обработкой ошибок"""
         try:
             print(f"Connecting to RTSP stream: {self.rtsp_url}")
 
-            # Пробуем разные бэкенды
-            backends = [
-                (cv2.CAP_FFMPEG, "FFMPEG"),
-                (cv2.CAP_ANY, "ANY")
-            ]
+            # Добавляем таймауты и параметры
+            self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
 
-            for backend, name in backends:
-                print(f"Trying {name} backend...")
-                self.cap = cv2.VideoCapture(self.rtsp_url, backend)
+            # Устанавливаем параметры
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.set(cv2.CAP_PROP_FPS, 15)
+            self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 10000)
 
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                self.cap.set(cv2.CAP_PROP_FPS, 15)
+            if not self.cap.isOpened():
+                print("Failed to open RTSP stream with FFMPEG, trying ANY backend")
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_ANY)
 
-                if self.cap.isOpened():
-                    self.backend_name = name
-                    print(f"{name} backend opened successfully")
-
-                    time.sleep(2)
-
-                    # Пробуем прочитать первый кадр
-                    ret, test_frame = self.cap.read()
-                    if ret:
-                        print(f"Successfully read first frame: {test_frame.shape}")
-                        break
-                    else:
-                        print(f"{name} backend opened but cannot read frames")
-                        self.cap.release()
-                else:
-                    print(f"{name} backend failed to open")
-
-            if not self.cap or not self.cap.isOpened():
+            if not self.cap.isOpened():
                 raise Exception("All backends failed to open RTSP stream")
+
+            # Даем время на инициализацию
+            time.sleep(2)
+
+            # Пробуем прочитать несколько кадров
+            for i in range(5):
+                ret, frame = self.cap.read()
+                if ret:
+                    print(f"Successfully read frame {i + 1}: {frame.shape}")
+                    break
+                else:
+                    print(f"Failed to read frame {i + 1}, retrying...")
+                    time.sleep(1)
+
+            if not ret:
+                raise Exception("Cannot read frames from RTSP stream")
 
             # Получаем информацию о потоке
             width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -526,18 +524,17 @@ class VideoAnalyticsServer:
             self.stream_info = {
                 'resolution': f"{width}x{height}",
                 'fps': fps,
-                'backend': self.backend_name
+                'backend': "FFMPEG/ANY"
             }
 
             print(f"Stream info: {self.stream_info}")
 
             self.processing = True
 
-            # Запускаем поток для чтения кадров
+            # Запускаем потоки
             self.stream_thread = threading.Thread(target=self._read_frames, daemon=True)
             self.stream_thread.start()
 
-            # Запускаем поток для обработки
             self.process_thread = threading.Thread(target=self._processing_loop, daemon=True)
             self.process_thread.start()
 
@@ -546,6 +543,7 @@ class VideoAnalyticsServer:
 
         except Exception as e:
             print(f"Error starting video stream: {e}")
+            self.processing = False
             return False
 
     def _read_frames(self):
@@ -691,16 +689,21 @@ class VideoAnalyticsServer:
             for track in confirmed_tracks:
                 try:
                     track_id = track.track_id
-                    bbox = track.mean[:4].copy()
-                    bbox[2] *= bbox[3]  # convert to [x, y, w, h] format
-                    bbox[:2] -= bbox[2:] / 2
 
-                    # Убедимся, что координаты валидны
-                    bbox = [max(0, float(coord)) for coord in bbox]
+                    # Правильное преобразование координат из [x, y, a, h] в [x, y, w, h]
+                    # где a = aspect ratio (w/h), h = height
+                    x_center, y_center, a, h = track.mean[:4]
+                    w = a * h
+                    x = x_center - w / 2
+                    y = y_center - h / 2
 
-                    # Проверяем что bbox внутри кадра
-                    if (bbox[0] < frame.shape[1] and bbox[1] < frame.shape[0] and
-                            bbox[2] > 10 and bbox[3] > 10):  # минимальный размер
+                    bbox = [float(x), float(y), float(w), float(h)]
+
+                    # Проверяем валидность bbox
+                    if (bbox[2] > 10 and bbox[3] > 10 and  # минимальный размер
+                            bbox[0] >= 0 and bbox[1] >= 0 and  # x, y >= 0
+                            bbox[0] + bbox[2] <= frame.shape[1] and  # x + width <= frame width
+                            bbox[1] + bbox[3] <= frame.shape[0]):  # y + height <= frame height
 
                         current_tracks[track_id] = {
                             'bbox': bbox,
@@ -716,7 +719,7 @@ class VideoAnalyticsServer:
                             print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
                             self.update_visitor(track_id, bbox, frame)
                     else:
-                        print(f"  Track {track_id}: INVALID bbox {bbox}")
+                        print(f"  Track {track_id}: INVALID bbox {[int(x) for x in bbox]}")
 
                 except Exception as e:
                     print(f"  Error processing track {getattr(track, 'track_id', 'unknown')}: {e}")

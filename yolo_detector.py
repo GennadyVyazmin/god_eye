@@ -8,7 +8,7 @@ import os
 
 
 class YOLODetector:
-    def __init__(self, conf_threshold=0.5, nms_threshold=0.4):
+    def __init__(self, conf_threshold=0.3, nms_threshold=0.4):
         self.conf_threshold = conf_threshold
         self.nms_threshold = nms_threshold
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -82,8 +82,6 @@ class YOLODetector:
                                     'class': cls,
                                     'feature': feature
                                 })
-                            else:
-                                print(f"  Filtered small detection: {bbox}")
 
             else:  # torchhub
                 results = self.model(image_rgb)
@@ -106,8 +104,6 @@ class YOLODetector:
                                     'class': int(cls),
                                     'feature': feature
                                 })
-                            else:
-                                print(f"  Filtered small detection: {bbox}")
 
             return detections
 
@@ -264,7 +260,7 @@ class FaceClothingDetector:
 
         if use_yolo:
             try:
-                self.detector = YOLODetector(conf_threshold=0.3)  # Низкий порог для лучшей детекции
+                self.detector = YOLODetector(conf_threshold=0.3)
                 print("YOLO detector initialized successfully")
                 self.detector_type = "yolo"
             except Exception as e:
@@ -279,14 +275,22 @@ class FaceClothingDetector:
         print(f"Using detector: {self.detector_type}")
 
     def detect_face_and_clothing(self, image):
-        """Детекция людей - возвращаем ТОЛЬКО уникальные детекции"""
-        detections = self.detector.detect(image)
+        """Упрощенная детекция для тестирования"""
+        try:
+            detections = self.detector.detect(image)
 
-        # Логируем количество обнаруженных людей
-        if len(detections) > 0:
-            confidences = [d['confidence'] for d in detections]
-            print(f"Detected {len(detections)} person(s) with confidence: {confidences}")
+            # Логируем для отладки
+            if len(detections) > 0:
+                print(f"Detected {len(detections)} objects")
+                for i, det in enumerate(detections):
+                    bbox = det['bbox']
+                    conf = det['confidence']
+                    print(f"  Detection {i}: {[int(x) for x in bbox]}, conf: {conf:.3f}")
+            else:
+                print("No detections")
 
-        # Вместо дублирования возвращаем пустой список для clothing
-        # Это предотвратит двойные детекции одного и того же человека
-        return detections, []  # Только лица, одежда пустая
+            return detections, []  # Только основные детекции
+
+        except Exception as e:
+            print(f"Error in detection: {e}")
+            return [], []

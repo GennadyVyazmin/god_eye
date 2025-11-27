@@ -194,48 +194,72 @@ class Tracker:
     def update(self, detections):
         """Perform measurement update and track management."""
         try:
+            # Валидация входных данных
+            if detections is None:
+                detections = []
+
             # Run matching cascade.
             matches, unmatched_tracks, unmatched_detections = self._match(detections)
 
             # Update track set.
             for track_idx, detection_idx in matches:
-                if track_idx < len(self.tracks) and detection_idx < len(detections):
+                # Проверяем валидность индексов
+                if (0 <= track_idx < len(self.tracks) and
+                        0 <= detection_idx < len(detections)):
                     self.tracks[track_idx].update(self.kf, detections[detection_idx])
+                else:
+                    print(f"Invalid match indices: track_idx={track_idx}, detection_idx={detection_idx}")
 
             for track_idx in unmatched_tracks:
-                if track_idx < len(self.tracks):
+                if 0 <= track_idx < len(self.tracks):
                     self.tracks[track_idx].mark_missed()
+                else:
+                    print(f"Invalid unmatched track index: {track_idx}")
 
             for detection_idx in unmatched_detections:
-                if detection_idx < len(detections):
+                if 0 <= detection_idx < len(detections):
                     self._initiate_track(detections[detection_idx])
+                else:
+                    print(f"Invalid unmatched detection index: {detection_idx}")
 
             # Remove deleted tracks.
             self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
         except Exception as e:
             print(f"Error in tracker update: {e}")
+            import traceback
+            traceback.print_exc()
             # В случае ошибки просто удаляем невалидные треки
             self.tracks = [t for t in self.tracks if not t.is_deleted()]
 
     def _match(self, detections):
+        if len(detections) == 0:
+            return [], [], []
+
         if len(self.tracks) == 0:
             return [], [], list(range(len(detections)))
 
-        # Split tracks into confirmed and unconfirmed
-        confirmed_tracks = [i for i, t in enumerate(self.tracks) if t.is_confirmed()]
-        unconfirmed_tracks = [i for i, t in enumerate(self.tracks) if not t.is_confirmed()]
+        # Разделяем треки на подтвержденные и неподтвержденные
+        confirmed_tracks = []
+        unconfirmed_tracks = []
 
-        # Match confirmed tracks
+        for i, t in enumerate(self.tracks):
+            if t.is_confirmed():
+                confirmed_tracks.append(i)
+            else:
+                unconfirmed_tracks.append(i)
+
+        # Сопоставляем подтвержденные треки
         matches_a, unmatched_tracks_a, unmatched_detections = self._linear_assignment(
             confirmed_tracks, detections)
 
-        # Match remaining tracks
+        # Сопоставляем оставшиеся неподтвержденные треки
         matches_b, unmatched_tracks_b, unmatched_detections = self._linear_assignment(
             unconfirmed_tracks, detections, unmatched_detections)
 
         matches = matches_a + matches_b
         unmatched_tracks = unmatched_tracks_a + unmatched_tracks_b
+
         return matches, unmatched_tracks, unmatched_detections
 
     def _linear_assignment(self, track_indices, detections, unmatched_detections=None):
@@ -251,32 +275,50 @@ class Tracker:
         cost_matrix = self.metric.distance(features, targets)
         cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
 
+        matches, unmatched_tracks, unmatched_detections_new = [], [], []
+
         try:
-            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+            if cost_matrix.size > 0:
+                row_indices, col_indices = linear_sum_assignment(cost_matrix)
+
+                # Создаем множества для быстрого поиска
+                matched_rows = set(row_indices)
+                matched_cols = set(col_indices)
+
+                # Обрабатываем совпадения
+                for row, col in zip(row_indices, col_indices):
+                    track_idx = track_indices[row]
+                    detection_idx = unmatched_detections[col]
+
+                    # Проверяем индексы на валидность
+                    if (row < len(track_indices) and col < len(unmatched_detections) and
+                            track_idx < len(self.tracks) and detection_idx < len(detections)):
+
+                        if cost_matrix[row, col] <= self.metric.matching_threshold:
+                            matches.append((track_idx, detection_idx))
+                        else:
+                            unmatched_tracks.append(track_idx)
+                            unmatched_detections_new.append(detection_idx)
+                    else:
+                        print(f"Invalid indices: track_idx={track_idx}, detection_idx={detection_idx}")
+
+                # Несовпавшие треки
+                for i, track_idx in enumerate(track_indices):
+                    if i not in matched_rows:
+                        unmatched_tracks.append(track_idx)
+
+                # Несовпавшие детекции
+                for j, detection_idx in enumerate(unmatched_detections):
+                    if j not in matched_cols:
+                        unmatched_detections_new.append(detection_idx)
+
         except Exception as e:
             print(f"Error in linear assignment: {e}")
-            return [], track_indices, unmatched_detections
+            # В случае ошибки возвращаем все как несовпавшие
+            unmatched_tracks = track_indices.copy()
+            unmatched_detections_new = unmatched_detections.copy()
 
-        matches, unmatched_tracks, unmatched_detections = [], [], []
-
-        for col, detection_idx in enumerate(unmatched_detections):
-            if col not in col_indices:
-                unmatched_detections.append(detection_idx)
-
-        for row, track_idx in enumerate(track_indices):
-            if row not in row_indices:
-                unmatched_tracks.append(track_idx)
-
-        for row, col in zip(row_indices, col_indices):
-            track_idx = track_indices[row]
-            detection_idx = unmatched_detections[col]
-            if cost_matrix[row, col] > self.metric.matching_threshold:
-                unmatched_tracks.append(track_idx)
-                unmatched_detections.append(detection_idx)
-            else:
-                matches.append((track_idx, detection_idx))
-
-        return matches, unmatched_tracks, unmatched_detections
+        return matches, unmatched_tracks, unmatched_detections_new
 
     def _initiate_track(self, detection):
         mean, covariance = self.kf.initiate(detection.to_xyah())
