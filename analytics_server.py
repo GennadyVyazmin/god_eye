@@ -59,6 +59,88 @@ class VideoAnalyticsServer:
 
     def setup_routes(self):
         """Настройка API маршрутов"""
+
+        # Основной маршрут
+        @self.app.route('/')
+        def index():
+            return '''
+            <html>
+                <head>
+                    <title>Video Analytics Server</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; margin: 40px; }
+                        .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
+                        code { background: #eee; padding: 2px 5px; }
+                    </style>
+                </head>
+                <body>
+                    <h1>Video Analytics Server</h1>
+                    <p>Сервер видеоаналитики на YOLO + DeepSORT для NVIDIA T400</p>
+
+                    <h2>Доступные endpoints:</h2>
+
+                    <div class="endpoint">
+                        <strong>GET /</strong> - Эта страница
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/status</strong> - Статус сервера
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/video_control</strong> - Статус видео потока
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>POST /api/video_control</strong> - Управление видео потоком<br>
+                        Body: <code>{"action": "start"}</code> или <code>{"action": "stop"}</code>
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/video_stream</strong> - Потоковое видео с детекциями
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/visitors</strong> - Список посетителей
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/statistics</strong> - Статистика
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>GET /api/reports</strong> - Список отчетов
+                    </div>
+
+                    <div class="endpoint">
+                        <strong>POST /api/reports</strong> - Генерация отчета<br>
+                        Body: <code>{"report_type": "daily_visitors", "start_date": "2024-01-01", "end_date": "2024-01-02"}</code>
+                    </div>
+
+                    <h2>Быстрые ссылки:</h2>
+                    <ul>
+                        <li><a href="/api/status">Статус сервера</a></li>
+                        <li><a href="/api/video_stream">Видео поток</a></li>
+                        <li><a href="/api/visitors">Посетители</a></li>
+                        <li><a href="/api/statistics">Статистика</a></li>
+                    </ul>
+                </body>
+            </html>
+            '''
+
+        # API маршруты
+        @self.app.route('/api/status')
+        def api_status():
+            return jsonify({
+                'status': 'running',
+                'version': '1.0',
+                'rtsp_url': self.rtsp_url,
+                'processing': self.processing,
+                'active_visitors': len(self.active_visitors),
+                'total_visitors': self.visitor_counter,
+                'last_processed': self.last_processed.isoformat() if self.last_processed else None
+            })
+
         self.api.add_resource(VideoControl, '/api/video_control')
         self.api.add_resource(VideoStream, '/api/video_stream')
         self.api.add_resource(Visitors, '/api/visitors')
@@ -139,12 +221,16 @@ class VideoAnalyticsServer:
 
     def _processing_loop(self):
         """Основной цикл обработки видео"""
+        frame_count = 0
         while self.processing:
             if self.frame is not None:
                 try:
-                    # Обработка кадра
-                    self.process_frame(self.frame)
-                    self.last_processed = datetime.now()
+                    # Обработка каждого 3-го кадра для оптимизации
+                    if frame_count % 3 == 0:
+                        self.process_frame(self.frame)
+                        self.last_processed = datetime.now()
+
+                    frame_count += 1
                 except Exception as e:
                     print(f"Error processing frame: {e}")
             time.sleep(0.033)  # ~30 FPS
@@ -205,8 +291,9 @@ class VideoAnalyticsServer:
                     'confidence': getattr(track, 'confidence', 1.0)
                 }
 
-                # Обновление/создание посетителя в БД
-                self.update_visitor(track_id, bbox, frame)
+                # Обновление/создание посетителя в БД (только для новых треков)
+                if track_id not in self.active_visitors:
+                    self.update_visitor(track_id, bbox, frame)
 
             # Обновление активных посетителей
             self.update_active_visitors(current_tracks)
@@ -237,41 +324,6 @@ class VideoAnalyticsServer:
 
                     self.visitor_counter += 1
                     print(f"New visitor created: track_id={track_id}")
-                else:
-                    # Обновляем время последнего визита
-                    visitor.last_seen = now
-                    visitor.visit_count = Visitor.visit_count + 1
-
-                    # Обновляем текущее появление
-                    appearance = Appearance.query.filter_by(
-                        visitor_id=visitor.id,
-                        end_time=None
-                    ).first()
-
-                    if not appearance:
-                        appearance = Appearance(visitor_id=visitor.id, start_time=now)
-                        db.session.add(appearance)
-
-                # Сохраняем детекцию (только каждые 10 кадров для экономии места)
-                if track_id % 10 == 0:
-                    x, y, w, h = bbox
-                    x, y, w, h = int(x), int(y), int(w), int(h)
-
-                    # Проверяем границы
-                    if (x >= 0 and y >= 0 and w > 0 and h > 0 and
-                            x + w <= frame.shape[1] and y + h <= frame.shape[0]):
-
-                        crop = frame[y:y + h, x:x + w]
-
-                        if crop.size > 0:
-                            detection = Detection(
-                                visitor_id=visitor.id,
-                                bbox_x=x, bbox_y=y, bbox_w=w, bbox_h=h,
-                                confidence=1.0,
-                                detection_type='person'
-                            )
-                            detection.set_image(crop)
-                            db.session.add(detection)
 
                 db.session.commit()
 
@@ -291,7 +343,6 @@ class VideoAnalyticsServer:
                 'first_seen': datetime.utcnow(),
                 'last_seen': datetime.utcnow()
             }
-            print(f"New active visitor: {track_id}")
 
         # Обновление времени последнего визита
         for track_id in current_ids:
@@ -310,7 +361,6 @@ class VideoAnalyticsServer:
 
         for track_id in inactive_visitors:
             del self.active_visitors[track_id]
-            print(f"Visitor {track_id} marked as inactive")
 
     def generate_report(self, report_type, start_date, end_date):
         """Генерация отчетов"""
@@ -324,8 +374,7 @@ class VideoAnalyticsServer:
                 data = {
                     'total_visitors': len(visitors),
                     'unique_visitors': len(set([v.track_id for v in visitors])),
-                    'visit_times': [v.first_seen.isoformat() for v in visitors],
-                    'average_visit_duration': 0
+                    'visit_times': [v.first_seen.isoformat() for v in visitors]
                 }
 
             elif report_type == 'popular_times':
@@ -372,6 +421,7 @@ class VideoControl(Resource):
                 'processing': server.processing,
                 'rtsp_url': server.rtsp_url,
                 'active_visitors': len(server.active_visitors),
+                'total_visitors': server.visitor_counter,
                 'last_processed': server.last_processed.isoformat() if server.last_processed else None
             }
             return status, 200
@@ -382,6 +432,9 @@ class VideoControl(Resource):
         """Управление видео потоком"""
         try:
             data = request.get_json()
+            if not data:
+                return {'error': 'No JSON data provided'}, 400
+
             action = data.get('action')
 
             if action == 'start':
@@ -395,7 +448,7 @@ class VideoControl(Resource):
                 return {'message': 'Video stream stopped'}, 200
 
             else:
-                return {'error': 'Invalid action'}, 400
+                return {'error': 'Invalid action. Use "start" or "stop"'}, 400
 
         except Exception as e:
             return {'error': str(e)}, 500
@@ -424,11 +477,6 @@ class VideoStream(Resource):
                         # Добавляем ID
                         cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                        # Добавляем confidence
-                        confidence = track.get('confidence', 0)
-                        cv2.putText(frame, f'Conf: {confidence:.2f}', (x1, y1 - 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
                     # Добавляем общую статистику
                     cv2.putText(frame, f'Active Visitors: {len(server.active_visitors)}',
@@ -469,23 +517,10 @@ class ProcessImage(Resource):
             # Обработка кадра
             tracks = server.process_frame(frame)
 
-            # Рисуем bounding boxes на изображении
-            for track_id, track in tracks.items():
-                x, y, w, h = track['bbox']
-                x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            # Кодируем результат
-            _, buffer = cv2.imencode('.jpg', frame)
-            result_image = base64.b64encode(buffer).decode('utf-8')
-
             return {
                 'tracks': tracks,
                 'visitor_count': len(server.active_visitors),
-                'processed_image': result_image
+                'total_visitors': server.visitor_counter
             }, 200
 
         except Exception as e:
@@ -528,13 +563,22 @@ class Reports(Resource):
         """Генерация отчета"""
         try:
             data = request.get_json()
+            if not data:
+                return {'error': 'No JSON data provided'}, 400
+
             report_type = data.get('report_type')
-            start_date = datetime.fromisoformat(data.get('start_date'))
-            end_date = datetime.fromisoformat(data.get('end_date'))
+            start_date_str = data.get('start_date')
+            end_date_str = data.get('end_date')
+
+            if not report_type or not start_date_str or not end_date_str:
+                return {'error': 'Missing required fields: report_type, start_date, end_date'}, 400
+
+            start_date = datetime.fromisoformat(start_date_str)
+            end_date = datetime.fromisoformat(end_date_str)
 
             report_id = server.generate_report(report_type, start_date, end_date)
 
-            return {'report_id': report_id}, 200
+            return {'report_id': report_id, 'message': 'Report generated successfully'}, 200
 
         except Exception as e:
             return {'error': str(e)}, 500
@@ -549,7 +593,7 @@ class Reports(Resource):
                     'id': r.id,
                     'report_type': r.report_type,
                     'generated_at': r.generated_at.isoformat(),
-                    'data': json.loads(r.data)
+                    'data': json.loads(r.data) if r.data else {}
                 } for r in reports]
 
                 return result, 200
@@ -575,7 +619,9 @@ class Statistics(Resource):
                     'today_visitors': today_visitors,
                     'currently_tracking': len(server.active_visitors),
                     'processing_status': server.processing,
-                    'rtsp_stream': server.rtsp_url
+                    'rtsp_stream': server.rtsp_url,
+                    'server_uptime': str(
+                        datetime.now() - server_start_time) if 'server_start_time' in globals() else 'unknown'
                 }, 200
 
         except Exception as e:
@@ -584,6 +630,7 @@ class Statistics(Resource):
 
 # Глобальный экземпляр сервера
 server = VideoAnalyticsServer()
+server_start_time = datetime.now()
 
 if __name__ == '__main__':
     server.run()
