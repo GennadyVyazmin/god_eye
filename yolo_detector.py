@@ -161,15 +161,19 @@ class YOLODetector:
         return feature.astype(np.float32)
 
 
+# В yolo_detector.py убедитесь что есть fallback на motion detection
 class FaceClothingDetector:
     def __init__(self):
-        print("Initializing YOLO detector...")
-        self.yolo_detector = YOLODetector()
-
-        if self.yolo_detector.model is None:
-            print("WARNING: YOLO detector failed to initialize. Using fallback mode.")
-        else:
+        print("Initializing FaceClothingDetector...")
+        try:
+            from ultralytics import YOLO
+            self.yolo_detector = YOLODetector()
             print("YOLO detector initialized successfully")
+        except Exception as e:
+            print(f"YOLO initialization failed: {e}")
+            print("Using motion detection fallback")
+            from simple_detector import SimpleDetector
+            self.detector = SimpleDetector()
 
     def detect_face_and_clothing(self, image):
         """Детекция людей с разделением на лицо и одежду"""
