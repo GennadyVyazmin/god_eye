@@ -36,11 +36,16 @@ class VideoAnalyticsServer:
 
         # Инициализация детектора и трекера
         print("Initializing FaceClothingDetector...")
-        self.detector = FaceClothingDetector()
+        self.detector = FaceClothingDetector(use_simple_detector=True)  # Используем упрощенный детектор
 
         print("Initializing DeepSORT tracker...")
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # Увеличили порог matching_threshold
-        self.tracker = Tracker(self.metric, max_iou_distance=0.7, max_age=50, n_init=5)  # Увеличили n_init
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.7)  # Увеличили порог matching_threshold
+        self.tracker = Tracker(
+            self.metric,
+            max_iou_distance=0.9,  # Увеличили max_iou_distance
+            max_age=100,  # Увеличили max_age
+            n_init=3  # Уменьшили n_init для быстрого подтверждения
+        )
 
         # Видео поток
         self.cap = None
@@ -633,31 +638,38 @@ class VideoAnalyticsServer:
             # Логируем общее количество детекций
             total_detections = len(face_detections) + len(clothing_detections)
             if total_detections > 0:
-                print(f"Frame {self.frames_processed}: Found {total_detections} detections")
+                print(
+                    f"Frame {self.frames_processed}: Found {total_detections} detections (faces: {len(face_detections)}, clothing: {len(clothing_detections)})")
 
             # Объединяем все детекции
             all_detections = face_detections + clothing_detections
 
             # Конвертация в формат DeepSORT
             deepsort_detections = []
-            for det in all_detections:
+            for i, det in enumerate(all_detections):
                 bbox = det['bbox']
                 confidence = det['confidence']
                 feature = det['feature']
 
                 deepsort_det = DeepSortDetection(bbox, confidence, feature)
                 deepsort_detections.append(deepsort_det)
+                print(f"  Detection {i}: bbox={bbox}, conf={confidence:.3f}")
+
+            # Логируем состояние трекера до обновления
+            print(
+                f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {len([t for t in self.tracker.tracks if t.is_confirmed()])})")
 
             # Обновление трекера
             self.tracker.predict()
             self.tracker.update(deepsort_detections)
 
+            # Логируем состояние трекера после обновления
+            confirmed_tracks = [t for t in self.tracker.tracks if t.is_confirmed()]
+            print(f"Tracks after update: {len(self.tracker.tracks)} (confirmed: {len(confirmed_tracks)})")
+
             # Обработка треков
             current_tracks = {}
-            for track in self.tracker.tracks:
-                if not track.is_confirmed():
-                    continue
-
+            for track in confirmed_tracks:
                 track_id = track.track_id
                 bbox = track.mean[:4].copy()
                 bbox[2] *= bbox[3]
@@ -669,11 +681,15 @@ class VideoAnalyticsServer:
                 current_tracks[track_id] = {
                     'bbox': bbox,
                     'track_id': track_id,
-                    'confidence': getattr(track, 'confidence', 1.0)
+                    'confidence': getattr(track, 'confidence', 1.0),
+                    'hits': track.hits
                 }
+
+                print(f"  Track {track_id}: bbox={bbox}, hits={track.hits}")
 
                 # Обновление/создание посетителя в БД (только для новых треков)
                 if track_id not in self.active_visitors:
+                    print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
                     self.update_visitor(track_id, bbox, frame)
 
             # Обновление активных посетителей
@@ -682,6 +698,8 @@ class VideoAnalyticsServer:
             # Логируем активные треки
             if len(current_tracks) > 0:
                 print(f"Active tracks: {list(current_tracks.keys())}")
+            else:
+                print("No active tracks")
 
             return current_tracks
 

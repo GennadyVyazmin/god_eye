@@ -316,3 +316,116 @@ class FaceClothingDetector:
             })
 
         return face_detections, clothing_detections
+
+    class PersonDetector:
+        def __init__(self, conf_threshold=0.5):
+            self.conf_threshold = conf_threshold
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"Using device: {self.device}")
+
+            try:
+                from ultralytics import YOLO
+                self.model = YOLO('yolov8s.pt')  # Более точная модель
+                self.model_type = 'ultralytics'
+                print("YOLOv8 model loaded successfully")
+
+            except Exception as e:
+                print(f"YOLOv8 initialization failed: {e}")
+                try:
+                    self.model = YOLO('yolov5s.pt')
+                    print("YOLOv5 model loaded successfully")
+                except Exception as e2:
+                    print(f"All YOLO initializations failed: {e2}")
+                    self.model = None
+
+            if self.model:
+                print("Person detector initialized successfully")
+
+            self.person_class_id = 0  # person class in COCO
+
+        def detect(self, image):
+            """Детекция только людей"""
+            if self.model is None:
+                return []
+
+            try:
+                # Конвертируем BGR в RGB
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                else:
+                    image_rgb = image
+
+                # Детекция
+                results = self.model(image_rgb, verbose=False, conf=self.conf_threshold)
+                detections = []
+
+                if len(results) > 0 and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    for box in boxes:
+                        cls = int(box.cls[0].cpu().numpy())
+                        conf = box.conf[0].cpu().numpy()
+
+                        if cls == self.person_class_id and conf >= self.conf_threshold:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+                            feature = self._extract_feature(image, bbox)
+
+                            detections.append({
+                                'bbox': bbox,
+                                'confidence': float(conf),
+                                'class': cls,
+                                'feature': feature
+                            })
+
+                return detections
+
+            except Exception as e:
+                print(f"Error in person detection: {e}")
+                return []
+
+        def _extract_feature(self, image, bbox):
+            """Упрощенное извлечение фич"""
+            x, y, w, h = [int(coord) for coord in bbox]
+
+            # Проверка границ
+            h_img, w_img = image.shape[:2]
+            x = max(0, min(x, w_img - 1))
+            y = max(0, min(y, h_img - 1))
+            w = max(1, min(w, w_img - x))
+            h = max(1, min(h, h_img - y))
+
+            crop = image[y:y + h, x:x + w]
+            if crop.size == 0:
+                return np.random.randn(128).astype(np.float32)  # Уменьшили размерность
+
+            try:
+                # Простые фичи на основе гистограмм
+                if len(crop.shape) == 3:
+                    # Цветовые гистограммы
+                    hist_b = cv2.calcHist([crop], [0], None, [8], [0, 256]).flatten()
+                    hist_g = cv2.calcHist([crop], [1], None, [8], [0, 256]).flatten()
+                    hist_r = cv2.calcHist([crop], [2], None, [8], [0, 256]).flatten()
+
+                    # Grayscale гистограмма
+                    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                    hist_gray = cv2.calcHist([gray], [0], None, [8], [0, 256]).flatten()
+
+                    feature = np.concatenate([hist_b, hist_g, hist_r, hist_gray])
+                else:
+                    feature = cv2.calcHist([crop], [0], None, [32], [0, 256]).flatten()
+
+                # Нормализация
+                feature_norm = np.linalg.norm(feature)
+                if feature_norm > 0:
+                    feature = feature / feature_norm
+
+                # Добиваем до 128 размерности
+                if len(feature) < 128:
+                    feature = np.pad(feature, (0, 128 - len(feature)))
+                elif len(feature) > 128:
+                    feature = feature[:128]
+
+            except Exception as e:
+                feature = np.random.randn(128).astype(np.float32)
+
+            return feature.astype(np.float32)
