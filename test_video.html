@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Stream Test</title>
+</head>
+<body>
+    <h1>Video Stream Test</h1>
+
+    <h2>Method 1: Direct Image</h2>
+    <img src="http://10.0.0.189:5000/api/video_stream" width="640" height="480">
+
+    <h2>Method 2: Iframe</h2>
+    <iframe src="http://10.0.0.189:5000/api/video_stream" width="640" height="480"></iframe>
+
+    <h2>Method 3: JavaScript fetch</h2>
+    <div id="video-container"></div>
+
+    <script>
+        // Method 3: Manual stream handling
+        const videoContainer = document.getElementById('video-container');
+        const img = document.createElement('img');
+        img.src = 'http://10.0.0.189:5000/api/video_stream';
+        img.width = 640;
+        img.height = 480;
+        img.onerror = function() {
+            console.error('Failed to load video stream');
+            videoContainer.innerHTML = '<p style="color: red;">Failed to load video stream</p>';
+        };
+        videoContainer.appendChild(img);
+    </script>
+</body>
+</html>
