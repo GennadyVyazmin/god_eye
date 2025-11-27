@@ -114,6 +114,10 @@ class Track:
     def is_deleted(self):
         return self.state == 'deleted'
 
+    # ДОБАВЛЕН МЕТОД ДЛЯ ДЕБАГГИНГА
+    def __repr__(self):
+        return f"Track(id={self.track_id}, state={self.state}, hits={self.hits}, age={self.age})"
+
 
 class Detection:
     def __init__(self, tlwh, confidence, feature):

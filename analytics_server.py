@@ -39,13 +39,13 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Упрощенные параметры для лучшей стабильности
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.4)  # Более низкий порог
+        # Мягкие параметры для лучшего трекинга
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # Средний порог
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.7,
-            max_age=20,  # Уменьшили max_age
-            n_init=3  # Увеличили n_init для стабильности
+            max_iou_distance=0.9,  # Увеличили для лучшего сопоставления
+            max_age=50,  # Увеличили max_age
+            n_init=1  # Уменьшили n_init для быстрого подтверждения
         )
 
         # Видео поток
@@ -668,7 +668,13 @@ class VideoAnalyticsServer:
 
             # Логируем состояние трекера до обновления
             confirmed_before = len([t for t in self.tracker.tracks if t.is_confirmed()])
-            print(f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {confirmed_before})")
+            tentative_before = len([t for t in self.tracker.tracks if t.is_tentative()])
+            print(
+                f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {confirmed_before}, tentative: {tentative_before})")
+
+            # ДЕБАГ: выводим информацию о каждом треке
+            for i, track in enumerate(self.tracker.tracks):
+                print(f"    Track {i}: {track}")
 
             # Обновление трекера
             self.tracker.predict()
@@ -682,11 +688,19 @@ class VideoAnalyticsServer:
 
             # Логируем состояние трекера после обновления
             confirmed_tracks = [t for t in self.tracker.tracks if t.is_confirmed()]
-            print(f"Tracks after update: {len(self.tracker.tracks)} (confirmed: {len(confirmed_tracks)})")
+            tentative_tracks = [t for t in self.tracker.tracks if t.is_tentative()]
+            print(
+                f"Tracks after update: {len(self.tracker.tracks)} (confirmed: {len(confirmed_tracks)}, tentative: {len(tentative_tracks)})")
 
-            # Обработка треков
+            # ДЕБАГ: выводим информацию о каждом треке после обновления
+            for i, track in enumerate(self.tracker.tracks):
+                print(f"    Track {i}: {track}")
+
+            # Обработка треков - ВКЛЮЧАЕМ ТАКЖЕ TENTATIVE ТРЕКИ ДЛЯ ТЕСТИРОВАНИЯ
             current_tracks = {}
-            for track in confirmed_tracks:
+            all_tracks_to_process = [t for t in self.tracker.tracks if t.is_confirmed() or t.is_tentative()]
+
+            for track in all_tracks_to_process:
                 try:
                     track_id = track.track_id
 
@@ -709,15 +723,20 @@ class VideoAnalyticsServer:
                             'bbox': bbox,
                             'track_id': track_id,
                             'confidence': getattr(track, 'confidence', 1.0),
-                            'hits': track.hits
+                            'hits': track.hits,
+                            'state': track.state  # Добавляем состояние для дебаггинга
                         }
 
-                        print(f"  Track {track_id}: bbox={[int(x) for x in bbox]}, hits={track.hits}")
+                        print(f"  Track {track_id} ({track.state}): bbox={[int(x) for x in bbox]}, hits={track.hits}")
 
-                        # Обновление/создание посетителя в БД (только для новых треков)
-                        if track_id not in self.active_visitors:
+                        # Обновление/создание посетителя в БД (для confirmed треков И tentative для тестирования)
+                        if track_id not in self.active_visitors and track.is_confirmed():
                             print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
                             self.update_visitor(track_id, bbox, frame)
+                        elif track.is_tentative():
+                            print(
+                                f"  ⏳ TENTATIVE VISITOR: track_id={track_id}, needs {self.tracker.n_init - track.hits} more hits")
+
                     else:
                         print(f"  Track {track_id}: INVALID bbox {[int(x) for x in bbox]}")
 
@@ -763,22 +782,25 @@ class VideoAnalyticsServer:
             print(f"Error updating visitor: {e}")
 
     def update_active_visitors(self, current_tracks):
-        """Обновление списка активных посетителей"""
+        """Обновление списка активных посетителей - ВРЕМЕННО ДЛЯ ТЕСТИРОВАНИЯ"""
         current_ids = set(current_tracks.keys())
         previous_ids = set(self.active_visitors.keys())
 
         new_visitors = current_ids - previous_ids
         for track_id in new_visitors:
+            # ВРЕМЕННО: добавляем всех треков, даже tentative
             self.active_visitors[track_id] = {
                 'first_seen': datetime.utcnow(),
-                'last_seen': datetime.utcnow()
+                'last_seen': datetime.utcnow(),
+                'state': current_tracks[track_id].get('state', 'unknown')
             }
+            print(f"  ✅ ADDED TO ACTIVE VISITORS: track_id={track_id}")
 
         for track_id in current_ids:
             if track_id in self.active_visitors:
                 self.active_visitors[track_id]['last_seen'] = datetime.utcnow()
 
-        inactive_timeout = timedelta(minutes=5)
+        inactive_timeout = timedelta(minutes=1)  # Уменьшили для тестирования
         now = datetime.utcnow()
         inactive_visitors = []
 
@@ -789,6 +811,7 @@ class VideoAnalyticsServer:
 
         for track_id in inactive_visitors:
             del self.active_visitors[track_id]
+            print(f"  🗑️ REMOVED FROM ACTIVE VISITORS: track_id={track_id}")
 
     def generate_report(self, report_type, start_date, end_date):
         """Генерация отчетов"""
