@@ -7,9 +7,11 @@ import base64
 from flask import Flask, request, jsonify, Response
 from flask_restful import Api, Resource
 from flask_socketio import SocketIO, emit
+from yolo_detector import FaceClothingDetector
 import threading
 import time
 import os
+
 
 # Настройки для OpenCV
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
@@ -36,7 +38,7 @@ class VideoAnalyticsServer:
 
         # Инициализация детектора и трекера
         print("Initializing FaceClothingDetector...")
-        self.detector = FaceClothingDetector(use_simple_detector=True)  # Используем упрощенный детектор
+        self.detector = FaceClothingDetector(use_yolo=True)  # Используем YOLO детектор
 
         print("Initializing DeepSORT tracker...")
         self.metric = NearestNeighborDistanceMetric("cosine", 0.7)  # Увеличили порог matching_threshold
