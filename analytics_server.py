@@ -39,8 +39,8 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector()
 
         print("Initializing DeepSORT tracker...")
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.2)
-        self.tracker = Tracker(self.metric, max_iou_distance=0.7, max_age=70, n_init=3)
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # Увеличили порог matching_threshold
+        self.tracker = Tracker(self.metric, max_iou_distance=0.7, max_age=50, n_init=5)  # Увеличили n_init
 
         # Видео поток
         self.cap = None
@@ -627,20 +627,32 @@ class VideoAnalyticsServer:
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""
         try:
+            # Детекция лиц и одежды
             face_detections, clothing_detections = self.detector.detect_face_and_clothing(frame)
+
+            # Логируем общее количество детекций
+            total_detections = len(face_detections) + len(clothing_detections)
+            if total_detections > 0:
+                print(f"Frame {self.frames_processed}: Found {total_detections} detections")
+
+            # Объединяем все детекции
             all_detections = face_detections + clothing_detections
 
+            # Конвертация в формат DeepSORT
             deepsort_detections = []
             for det in all_detections:
                 bbox = det['bbox']
                 confidence = det['confidence']
                 feature = det['feature']
+
                 deepsort_det = DeepSortDetection(bbox, confidence, feature)
                 deepsort_detections.append(deepsort_det)
 
+            # Обновление трекера
             self.tracker.predict()
             self.tracker.update(deepsort_detections)
 
+            # Обработка треков
             current_tracks = {}
             for track in self.tracker.tracks:
                 if not track.is_confirmed():
@@ -650,6 +662,8 @@ class VideoAnalyticsServer:
                 bbox = track.mean[:4].copy()
                 bbox[2] *= bbox[3]
                 bbox[:2] -= bbox[2:] / 2
+
+                # Убедимся, что координаты валидны
                 bbox = [max(0, float(coord)) for coord in bbox]
 
                 current_tracks[track_id] = {
@@ -658,10 +672,17 @@ class VideoAnalyticsServer:
                     'confidence': getattr(track, 'confidence', 1.0)
                 }
 
+                # Обновление/создание посетителя в БД (только для новых треков)
                 if track_id not in self.active_visitors:
                     self.update_visitor(track_id, bbox, frame)
 
+            # Обновление активных посетителей
             self.update_active_visitors(current_tracks)
+
+            # Логируем активные треки
+            if len(current_tracks) > 0:
+                print(f"Active tracks: {list(current_tracks.keys())}")
+
             return current_tracks
 
         except Exception as e:
