@@ -3,128 +3,112 @@ import numpy as np
 import torch
 
 
-class SimpleDetector:
+class SimpleFeatureDetector:
     def __init__(self, conf_threshold=0.5):
         self.conf_threshold = conf_threshold
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
 
-        # Используем OpenCV для детекции движения
-        self.fgbg = cv2.createBackgroundSubtractorMOG2(detectShadows=True)
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Загрузка YOLO модели
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO('yolov8n.pt')
+            print("YOLO model loaded successfully")
+        except ImportError:
+            print("Ultralytics not available, using fallback")
+            self.model = None
 
-        print("Simple motion detector initialized")
+        self.person_class_id = 0
 
     def detect(self, image):
-        """Детекция движения"""
+        """Детекция людей с ПРОСТЫМИ фичами"""
+        if self.model is None:
+            return []
+
         try:
-            # Конвертируем в grayscale для детекции движения
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # Конвертируем BGR в RGB
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            # Вычитание фона
-            fgmask = self.fgbg.apply(gray)
-            fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, self.kernel)
-
-            # Находим контуры
-            contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+            # Детекция
+            results = self.model(image_rgb, verbose=False)
             detections = []
 
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > 1000:  # Фильтр по размеру
-                    x, y, w, h = cv2.boundingRect(contour)
+            if len(results) > 0 and results[0].boxes is not None:
+                boxes = results[0].boxes
+                for box in boxes:
+                    cls = int(box.cls[0].cpu().numpy())
+                    conf = box.conf[0].cpu().numpy()
 
-                    # Рассчитываем confidence на основе размера области
-                    confidence = min(area / 5000.0, 1.0)
+                    if cls == self.person_class_id and conf >= self.conf_threshold:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
-                    if confidence >= self.conf_threshold:
-                        bbox = [float(x), float(y), float(w), float(h)]
-                        feature = self._extract_feature(image, bbox)
-
-                        detections.append({
-                            'bbox': bbox,
-                            'confidence': confidence,
-                            'class': 0,  # person class
-                            'feature': feature
-                        })
+                        if bbox[2] > 50 and bbox[3] > 100:
+                            # ПРОСТАЯ фича - только размер и положение
+                            feature = self._extract_simple_feature(bbox, image.shape)
+                            detections.append({
+                                'bbox': bbox,
+                                'confidence': float(conf),
+                                'class': cls,
+                                'feature': feature
+                            })
 
             return detections
 
         except Exception as e:
-            print(f"Error in motion detection: {e}")
+            print(f"Error in detection: {e}")
             return []
 
-    def _extract_feature(self, image, bbox):
-        """Упрощенное извлечение фич"""
-        x, y, w, h = [int(coord) for coord in bbox]
+    def _extract_simple_feature(self, bbox, image_shape):
+        """СУПЕР ПРОСТАЯ фича на основе положения и размера"""
+        x, y, w, h = bbox
 
-        crop = image[y:y + h, x:x + w]
-        if crop.size == 0:
-            return np.random.randn(512).astype(np.float32)
+        # Нормализуем координаты относительно размера изображения
+        img_h, img_w = image_shape[:2]
+        x_norm = x / img_w
+        y_norm = y / img_h
+        w_norm = w / img_w
+        h_norm = h / img_h
 
-        try:
-            crop_resized = cv2.resize(crop, (128, 256))
+        # Соотношение сторон
+        aspect_ratio = w / h if h > 0 else 1.0
 
-            if len(crop_resized.shape) == 3:
-                feature = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
-            else:
-                feature = crop_resized
+        # Площадь
+        area = (w * h) / (img_w * img_h)
 
-            feature = cv2.resize(feature, (16, 32))
-            feature = feature.flatten()
+        # Центр bbox
+        center_x = x_norm + w_norm / 2
+        center_y = y_norm + h_norm / 2
 
-            feature_norm = np.linalg.norm(feature)
-            if feature_norm > 0:
-                feature = feature / feature_norm
-            else:
-                feature = np.zeros_like(feature)
+        # Собираем простую фичу
+        feature = np.array([
+            x_norm, y_norm,  # позиция
+            w_norm, h_norm,  # размер
+            aspect_ratio,  # соотношение сторон
+            area,  # площадь
+            center_x, center_y  # центр
+        ], dtype=np.float32)
 
-            if len(feature) < 512:
-                feature = np.pad(feature, (0, 512 - len(feature)))
-            elif len(feature) > 512:
-                feature = feature[:512]
+        # Нормализация
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm > 0:
+            feature = feature / feature_norm
 
-        except Exception as e:
-            feature = np.random.randn(512).astype(np.float32)
-
-        return feature.astype(np.float32)
+        return feature
 
 
 class FaceClothingDetector:
     def __init__(self):
-        print("Initializing Simple Detector...")
-        self.detector = SimpleDetector()
-        print("Simple Detector initialized successfully")
+        print("Initializing Simple Feature Detector...")
+        self.detector = SimpleFeatureDetector(conf_threshold=0.5)
+        print("Simple detector initialized successfully")
 
     def detect_face_and_clothing(self, image):
-        """Детекция с разделением на лицо и одежду"""
+        """Детекция людей"""
         detections = self.detector.detect(image)
 
-        face_detections = []
-        clothing_detections = []
+        if len(detections) > 0:
+            confidences = [d['confidence'] for d in detections]
+            print(f"Detected {len(detections)} person(s) with confidence: {confidences}")
 
-        for det in detections:
-            bbox = det['bbox']
-            confidence = det['confidence']
-            feature = det['feature']
-
-            x, y, w, h = bbox
-
-            # Разделяем на лицо и одежду
-            face_bbox = [x, y, w, h // 3]
-            clothing_bbox = [x, y + h // 3, w, h * 2 // 3]
-
-            face_detections.append({
-                'bbox': face_bbox,
-                'confidence': confidence,
-                'feature': feature
-            })
-
-            clothing_detections.append({
-                'bbox': clothing_bbox,
-                'confidence': confidence,
-                'feature': feature
-            })
-
-        return face_detections, clothing_detections
+        return detections, []

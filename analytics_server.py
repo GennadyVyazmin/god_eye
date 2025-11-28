@@ -16,7 +16,7 @@ os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
 os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
 
 from models import db, Visitor, Detection, Appearance, Report
-from yolo_detector import FaceClothingDetector
+from simple_detector import FaceClothingDetector
 from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
 
 # Создаем Flask app и SocketIO
