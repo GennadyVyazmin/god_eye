@@ -39,13 +39,13 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Мягкие параметры для лучшего трекинга
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # Средний порог
+        # Строгие параметры для лучшего сопоставления
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.2)  # Уменьшили порог для строгости
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.9,  # Увеличили для лучшего сопоставления
-            max_age=50,  # Увеличили max_age
-            n_init=1  # Уменьшили n_init для быстрого подтверждения
+            max_iou_distance=0.7,  # Уменьшили для лучшего сопоставления
+            max_age=30,  # Средний max_age
+            n_init=3  # Увеличили для стабильности
         )
 
         # Видео поток
@@ -675,6 +675,26 @@ class VideoAnalyticsServer:
             # ДЕБАГ: выводим информацию о каждом треке
             for i, track in enumerate(self.tracker.tracks):
                 print(f"    Track {i}: {track}")
+
+            # ДЕБАГ: логируем процесс сопоставления
+            if len(deepsort_detections) > 0 and len(self.tracker.tracks) > 0:
+                print("=== MATCHING DEBUG ===")
+                features = [det.feature for det in deepsort_detections]
+                targets = [t.track_id for t in self.tracker.tracks if t.is_confirmed() or t.is_tentative()]
+
+                if len(targets) > 0:
+                    cost_matrix = self.tracker.metric.distance(features, targets)
+                    print(f"Cost matrix shape: {cost_matrix.shape}")
+                    print(f"Matching threshold: {self.tracker.metric.matching_threshold}")
+
+                    # Находим минимальные стоимости
+                    for i, det in enumerate(deepsort_detections):
+                        min_cost = np.min(cost_matrix[i]) if cost_matrix.size > 0 else 1.0
+                        best_match_idx = np.argmin(cost_matrix[i]) if cost_matrix.size > 0 else -1
+                        print(
+                            f"Detection {i}: min_cost={min_cost:.3f}, best_match_track={targets[best_match_idx] if best_match_idx != -1 else 'None'}")
+
+                print("======================")
 
             # Обновление трекера
             self.tracker.predict()

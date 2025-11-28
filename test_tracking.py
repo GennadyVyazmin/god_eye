@@ -1,34 +1,36 @@
-#!/usr/bin/env python3
-"""
-Простой тест трекинга
-"""
-
 import cv2
 import numpy as np
-from analytics_server import VideoAnalyticsServer
+from yolo_detector import YOLODetector
 
 
-def test_tracking():
-    # Создаем тестовый сервер
-    server = VideoAnalyticsServer()
+def test_feature_consistency():
+    detector = YOLODetector()
 
-    # Создаем тестовый кадр с человеком
-    test_frame = np.random.randint(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    # Создаем тестовое изображение
+    image1 = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+    cv2.rectangle(image1, (100, 100), (200, 300), (255, 255, 255), -1)
 
-    # Добавляем "человека" в кадр
-    cv2.rectangle(test_frame, (500, 300), (700, 800), (255, 255, 255), -1)
+    image2 = image1.copy()  # То же самое изображение
 
-    # Тестируем обработку кадра
-    print("Testing frame processing...")
-    tracks = server.process_frame(test_frame)
+    # Детектируем на обоих изображениях
+    detections1 = detector.detect(image1)
+    detections2 = detector.detect(image2)
 
-    print(f"Found {len(tracks)} tracks")
-    for track_id, track_data in tracks.items():
-        print(f"Track {track_id}: {track_data}")
+    print(f"Detections 1: {len(detections1)}")
+    print(f"Detections 2: {len(detections2)}")
 
-    # Проверяем активных посетителей
-    print(f"Active visitors: {len(server.active_visitors)}")
+    if len(detections1) > 0 and len(detections2) > 0:
+        feature1 = detections1[0]['feature']
+        feature2 = detections2[0]['feature']
+
+        # Вычисляем косинусное расстояние
+        similarity = np.dot(feature1, feature2) / (np.linalg.norm(feature1) * np.linalg.norm(feature2))
+        distance = 1 - similarity
+
+        print(f"Feature similarity: {similarity:.4f}")
+        print(f"Feature distance: {distance:.4f}")
+        print(f"Should match: {distance < 0.2}")
 
 
 if __name__ == '__main__':
-    test_tracking()
+    test_feature_consistency()
