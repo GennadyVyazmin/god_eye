@@ -4,7 +4,7 @@ import torch
 
 
 class SimpleFeatureDetector:
-    def __init__(self, conf_threshold=0.5):
+    def __init__(self, conf_threshold=0.3):  # Уменьшили порог
         self.conf_threshold = conf_threshold
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {self.device}")
@@ -14,8 +14,8 @@ class SimpleFeatureDetector:
             from ultralytics import YOLO
             self.model = YOLO('yolov8n.pt')
             print("YOLO model loaded successfully")
-        except ImportError:
-            print("Ultralytics not available, using fallback")
+        except Exception as e:
+            print(f"YOLO loading failed: {e}")
             self.model = None
 
         self.person_class_id = 0
@@ -43,7 +43,7 @@ class SimpleFeatureDetector:
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
-                        if bbox[2] > 50 and bbox[3] > 100:
+                        if bbox[2] > 30 and bbox[3] > 60:  # Уменьшили минимальный размер
                             # ПРОСТАЯ фича - только размер и положение
                             feature = self._extract_simple_feature(bbox, image.shape)
                             detections.append({
@@ -52,6 +52,7 @@ class SimpleFeatureDetector:
                                 'class': cls,
                                 'feature': feature
                             })
+                            print(f"  Detection: bbox={bbox}, conf={conf:.3f}")
 
             return detections
 
@@ -96,11 +97,32 @@ class SimpleFeatureDetector:
 
         return feature
 
+    def create_test_person_image(self):
+        """Создает тестовое изображение с человеком"""
+        # Создаем изображение с более контрастным "человеком"
+        image = np.ones((480, 640, 3), dtype=np.uint8) * 100
+
+        # Рисуем "человека" - вертикальный прямоугольник с "головой"
+        body_x, body_y = 200, 100
+        body_w, body_h = 80, 200
+
+        # Тело
+        cv2.rectangle(image,
+                      (body_x, body_y),
+                      (body_x + body_w, body_y + body_h),
+                      (255, 255, 255), -1)
+
+        # Голова
+        head_center = (body_x + body_w // 2, body_y - 20)
+        cv2.circle(image, head_center, 25, (255, 255, 255), -1)
+
+        return image
+
 
 class FaceClothingDetector:
     def __init__(self):
         print("Initializing Simple Feature Detector...")
-        self.detector = SimpleFeatureDetector(conf_threshold=0.5)
+        self.detector = SimpleFeatureDetector(conf_threshold=0.3)
         print("Simple detector initialized successfully")
 
     def detect_face_and_clothing(self, image):
