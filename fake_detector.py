@@ -3,31 +3,42 @@ import numpy as np
 
 
 class FakeDetector:
-    def __init__(self):
+    def __init__(self, use_yolo=True):  # Добавляем аргумент для совместимости
         print("Initializing Fake Detector for testing...")
         self.detection_count = 0
+        print("Fake detector ready - will always detect one person")
 
     def detect_face_and_clothing(self, image):
         """Фейковая детекция - всегда возвращает одного человека"""
         self.detection_count += 1
 
-        # Создаем фиксированный bbox
+        # Создаем фиксированный bbox в центре изображения
         h, w = image.shape[:2]
-        bbox = [w * 0.3, h * 0.2, w * 0.4, h * 0.6]  # 30% от ширины, 20% от высоты
+        bbox_width = w * 0.3
+        bbox_height = h * 0.6
+        x_center = w * 0.5
+        y_center = h * 0.5
+
+        bbox = [
+            x_center - bbox_width / 2,  # x
+            y_center - bbox_height / 2,  # y
+            bbox_width,  # width
+            bbox_height  # height
+        ]
 
         # Простая фича на основе bbox
         feature = self._extract_simple_feature(bbox, image.shape)
 
         detection = {
             'bbox': bbox,
-            'confidence': 0.8,
+            'confidence': 0.9,
             'class': 0,
             'feature': feature
         }
 
-        print(f"Fake detection #{self.detection_count}: bbox={[int(x) for x in bbox]}")
+        print(f"🎯 Fake detection #{self.detection_count}: bbox={[int(x) for x in bbox]}")
 
-        return [detection], []
+        return [detection], []  # Только лица, одежда пустая
 
     def _extract_simple_feature(self, bbox, image_shape):
         """Такая же простая фича как в simple_detector"""
