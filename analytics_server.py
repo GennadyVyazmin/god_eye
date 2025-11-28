@@ -1,4 +1,4 @@
-vimport cv2
+import cv2
 import numpy as np
 import torch
 from datetime import datetime, timedelta
