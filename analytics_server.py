@@ -1,4 +1,4 @@
-import cv2
+vimport cv2
 import numpy as np
 import torch
 from datetime import datetime, timedelta
@@ -39,13 +39,13 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Строгие параметры для лучшего сопоставления
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.2)  # Уменьшили порог для строгости
+        # ОЧЕНЬ мягкие параметры для тестирования
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.7)  # ОЧЕНЬ высокий порог
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.7,  # Уменьшили для лучшего сопоставления
-            max_age=30,  # Средний max_age
-            n_init=3  # Увеличили для стабильности
+            max_iou_distance=0.9,    # Высокий для лучшего сопоставления
+            max_age=20,              # Уменьшили для быстрого удаления
+            n_init=2                 # Минимальный для быстрого подтверждения
         )
 
         # Видео поток
@@ -507,10 +507,10 @@ class VideoAnalyticsServer:
             for i in range(5):
                 ret, frame = self.cap.read()
                 if ret:
-                    print(f"Successfully read frame {i + 1}: {frame.shape}")
+                    print(f"Successfully read frame {i+1}: {frame.shape}")
                     break
                 else:
-                    print(f"Failed to read frame {i + 1}, retrying...")
+                    print(f"Failed to read frame {i+1}, retrying...")
                     time.sleep(1)
 
             if not ret:
@@ -637,8 +637,7 @@ class VideoAnalyticsServer:
             # Логируем общее количество детекций
             total_detections = len(face_detections) + len(clothing_detections)
             if total_detections > 0:
-                print(
-                    f"Frame {self.frames_processed}: Found {total_detections} detections (faces: {len(face_detections)}, clothing: {len(clothing_detections)})")
+                print(f"Frame {self.frames_processed}: Found {total_detections} detections (faces: {len(face_detections)}, clothing: {len(clothing_detections)})")
 
             # Объединяем все детекции
             all_detections = face_detections + clothing_detections
@@ -669,32 +668,49 @@ class VideoAnalyticsServer:
             # Логируем состояние трекера до обновления
             confirmed_before = len([t for t in self.tracker.tracks if t.is_confirmed()])
             tentative_before = len([t for t in self.tracker.tracks if t.is_tentative()])
-            print(
-                f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {confirmed_before}, tentative: {tentative_before})")
+            print(f"Tracks before update: {len(self.tracker.tracks)} (confirmed: {confirmed_before}, tentative: {tentative_before})")
 
             # ДЕБАГ: выводим информацию о каждом треке
             for i, track in enumerate(self.tracker.tracks):
                 print(f"    Track {i}: {track}")
 
-            # ДЕБАГ: логируем процесс сопоставления
+            # ДЕБАГ: детальный анализ сопоставления
             if len(deepsort_detections) > 0 and len(self.tracker.tracks) > 0:
-                print("=== MATCHING DEBUG ===")
+                print("=== DETAILED MATCHING DEBUG ===")
                 features = [det.feature for det in deepsort_detections]
                 targets = [t.track_id for t in self.tracker.tracks if t.is_confirmed() or t.is_tentative()]
+                target_tracks = [t for t in self.tracker.tracks if t.is_confirmed() or t.is_tentative()]
 
                 if len(targets) > 0:
                     cost_matrix = self.tracker.metric.distance(features, targets)
                     print(f"Cost matrix shape: {cost_matrix.shape}")
                     print(f"Matching threshold: {self.tracker.metric.matching_threshold}")
 
-                    # Находим минимальные стоимости
                     for i, det in enumerate(deepsort_detections):
-                        min_cost = np.min(cost_matrix[i]) if cost_matrix.size > 0 else 1.0
-                        best_match_idx = np.argmin(cost_matrix[i]) if cost_matrix.size > 0 else -1
-                        print(
-                            f"Detection {i}: min_cost={min_cost:.3f}, best_match_track={targets[best_match_idx] if best_match_idx != -1 else 'None'}")
+                        for j, track_id in enumerate(targets):
+                            cost = cost_matrix[i, j]
+                            track = target_tracks[j]
+                            print(f"  Detection {i} -> Track {track_id}: cost={cost:.3f}, track_hits={track.hits}, track_state={track.state}")
 
-                print("======================")
+                            # Если стоимость низкая, но все равно не совпало - анализируем почему
+                            if cost < 0.5:
+                                print(f"    *** LOW COST BUT NOT MATCHED? ***")
+
+                    # Находим лучшие совпадения
+                    for i, det in enumerate(deepsort_detections):
+                        if cost_matrix.shape[1] > 0:
+                            min_cost = np.min(cost_matrix[i])
+                            best_match_idx = np.argmin(cost_matrix[i])
+                            best_track_id = targets[best_match_idx] if best_match_idx != -1 else 'None'
+                            print(f"Detection {i}: min_cost={min_cost:.3f}, best_match={best_track_id}")
+
+                            # Анализируем почему не совпало
+                            if min_cost > self.tracker.metric.matching_threshold:
+                                print(f"  *** NO MATCH: cost {min_cost:.3f} > threshold {self.tracker.metric.matching_threshold} ***")
+                        else:
+                            print(f"Detection {i}: No tracks to match with")
+
+                print("=================================")
 
             # Обновление трекера
             self.tracker.predict()
@@ -709,8 +725,7 @@ class VideoAnalyticsServer:
             # Логируем состояние трекера после обновления
             confirmed_tracks = [t for t in self.tracker.tracks if t.is_confirmed()]
             tentative_tracks = [t for t in self.tracker.tracks if t.is_tentative()]
-            print(
-                f"Tracks after update: {len(self.tracker.tracks)} (confirmed: {len(confirmed_tracks)}, tentative: {len(tentative_tracks)})")
+            print(f"Tracks after update: {len(self.tracker.tracks)} (confirmed: {len(confirmed_tracks)}, tentative: {len(tentative_tracks)})")
 
             # ДЕБАГ: выводим информацию о каждом треке после обновления
             for i, track in enumerate(self.tracker.tracks):
@@ -735,9 +750,9 @@ class VideoAnalyticsServer:
 
                     # Проверяем валидность bbox
                     if (bbox[2] > 10 and bbox[3] > 10 and  # минимальный размер
-                            bbox[0] >= 0 and bbox[1] >= 0 and  # x, y >= 0
-                            bbox[0] + bbox[2] <= frame.shape[1] and  # x + width <= frame width
-                            bbox[1] + bbox[3] <= frame.shape[0]):  # y + height <= frame height
+                        bbox[0] >= 0 and bbox[1] >= 0 and  # x, y >= 0
+                        bbox[0] + bbox[2] <= frame.shape[1] and  # x + width <= frame width
+                        bbox[1] + bbox[3] <= frame.shape[0]):  # y + height <= frame height
 
                         current_tracks[track_id] = {
                             'bbox': bbox,
@@ -754,8 +769,7 @@ class VideoAnalyticsServer:
                             print(f"  🆕 NEW VISITOR DETECTED: track_id={track_id}")
                             self.update_visitor(track_id, bbox, frame)
                         elif track.is_tentative():
-                            print(
-                                f"  ⏳ TENTATIVE VISITOR: track_id={track_id}, needs {self.tracker.n_init - track.hits} more hits")
+                            print(f"  ⏳ TENTATIVE VISITOR: track_id={track_id}, needs {self.tracker.n_init - track.hits} more hits")
 
                     else:
                         print(f"  Track {track_id}: INVALID bbox {[int(x) for x in bbox]}")

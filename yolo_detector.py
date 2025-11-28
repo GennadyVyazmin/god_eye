@@ -69,7 +69,7 @@ class YOLODetector:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_improved_feature(image, bbox)
+                                feature = self._extract_simple_stable_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -88,7 +88,7 @@ class YOLODetector:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_improved_feature(image, bbox)
+                                feature = self._extract_simple_stable_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -102,8 +102,11 @@ class YOLODetector:
             print(f"Error in YOLO detection: {e}")
             return []
 
-    def _extract_improved_feature(self, image, bbox):
-        """Улучшенное извлечение фич для лучшего сопоставления"""
+    def _extract_simple_stable_feature(self, image, bbox):
+        """
+        ПРОСТАЯ И СТАБИЛЬНАЯ фича, которая будет консистентной между кадрами
+        для одного и того же человека
+        """
         x, y, w, h = [int(coord) for coord in bbox]
 
         # Проверка границ
@@ -115,124 +118,62 @@ class YOLODetector:
 
         crop = image[y:y + h, x:x + w]
         if crop.size == 0:
-            return np.random.randn(512).astype(np.float32) * 0.1
+            return np.zeros(64, dtype=np.float32)
 
         try:
-            # Ресайзим к стандартному размеру
-            crop_resized = cv2.resize(crop, (64, 128))
+            # 1. Ресайзим к маленькому фиксированному размеру
+            crop_resized = cv2.resize(crop, (32, 64))  # Маленький размер для стабильности
 
-            # Конвертируем в grayscale
+            # 2. Конвертируем в grayscale (убираем цветовые вариации)
             gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
 
-            # Вычисляем HOG-like фичи
-            hog_features = self._compute_hog(gray)
+            # 3. Нормализуем яркость (очень важно!)
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
 
-            # Цветовые гистограммы
-            color_features = self._compute_color_histograms(crop_resized)
+            # 4. Размытие для уменьшения шума
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-            # Текстура (LBP-like)
-            texture_features = self._compute_texture(gray)
+            # 5. ПРОСТЫЕ фичи - гистограмма градиентов
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
 
-            # Объединяем все фичи
-            feature = np.concatenate([hog_features, color_features, texture_features])
+            # 6. Амплитуда и направление градиентов
+            magnitude = np.sqrt(gx ** 2 + gy ** 2)
+            orientation = np.arctan2(gy, gx) * (180 / np.pi)  # в градусах
+            orientation = np.mod(orientation, 180)  # 0-180 градусов
 
-            # Нормализация
+            # 7. Простая гистограмма направлений градиентов (8 бинов)
+            hist, _ = np.histogram(orientation, bins=8, range=(0, 180), weights=magnitude)
+
+            # 8. Добавляем простые статистики
+            mean_intensity = np.mean(gray)
+            std_intensity = np.std(gray)
+
+            # 9. Формируем фичу
+            feature = np.concatenate([
+                hist,
+                [mean_intensity, std_intensity],
+                [w / h]  # соотношение сторон
+            ])
+
+            # 10. L2 нормализация
             feature_norm = np.linalg.norm(feature)
             if feature_norm > 0:
                 feature = feature / feature_norm
             else:
                 feature = np.zeros_like(feature)
 
+            # 11. Добиваем до фиксированного размера
+            if len(feature) < 64:
+                feature = np.pad(feature, (0, 64 - len(feature)))
+            elif len(feature) > 64:
+                feature = feature[:64]
+
             return feature.astype(np.float32)
 
         except Exception as e:
-            print(f"Error extracting features: {e}")
-            return np.random.randn(512).astype(np.float32) * 0.1
-
-    def _compute_hog(self, gray_image):
-        """Вычисление HOG-like фич"""
-        try:
-            # Простой градиентный подход
-            gx = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1, ksize=3)
-
-            mag, ang = cv2.cartToPolar(gx, gy)
-
-            # Разбиваем на ячейки 8x8
-            cell_size = 8
-            h, w = gray_image.shape
-            n_cells_x = w // cell_size
-            n_cells_y = h // cell_size
-
-            orientation_bins = 9
-            hist_range = (0, 2 * np.pi)
-
-            hog_features = []
-
-            for i in range(n_cells_y):
-                for j in range(n_cells_x):
-                    cell_mag = mag[i * cell_size:(i + 1) * cell_size, j * cell_size:(j + 1) * cell_size]
-                    cell_ang = ang[i * cell_size:(i + 1) * cell_size, j * cell_size:(j + 1) * cell_size]
-
-                    hist, _ = np.histogram(cell_ang, bins=orientation_bins, range=hist_range, weights=cell_mag)
-                    hist = hist / (np.linalg.norm(hist) + 1e-8)  # L2 нормализация
-
-                    hog_features.extend(hist)
-
-            return np.array(hog_features)
-
-        except Exception as e:
-            print(f"Error computing HOG: {e}")
-            return np.zeros(81)  # 9x9 cells
-
-    def _compute_color_histograms(self, image):
-        """Цветовые гистограммы"""
-        try:
-            # Гистограммы для каждого канала
-            hist_b = cv2.calcHist([image], [0], None, [16], [0, 256]).flatten()
-            hist_g = cv2.calcHist([image], [1], None, [16], [0, 256]).flatten()
-            hist_r = cv2.calcHist([image], [2], None, [16], [0, 256]).flatten()
-
-            # Нормализация
-            hist_b = hist_b / (np.sum(hist_b) + 1e-8)
-            hist_g = hist_g / (np.sum(hist_g) + 1e-8)
-            hist_r = hist_r / (np.sum(hist_r) + 1e-8)
-
-            return np.concatenate([hist_b, hist_g, hist_r])
-
-        except Exception as e:
-            print(f"Error computing color histograms: {e}")
-            return np.zeros(48)
-
-    def _compute_texture(self, gray_image):
-        """Текстурные фичи"""
-        try:
-            # Простые статистики текстуры
-            mean = np.mean(gray_image)
-            std = np.std(gray_image)
-            entropy = self._compute_entropy(gray_image)
-
-            # Гистограмма градиентов
-            gx = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0)
-            gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1)
-            mag = np.sqrt(gx ** 2 + gy ** 2)
-            grad_hist, _ = np.histogram(mag, bins=16, range=[0, 256])
-            grad_hist = grad_hist / (np.sum(grad_hist) + 1e-8)
-
-            texture_features = np.concatenate([[mean, std, entropy], grad_hist])
-            return texture_features
-
-        except Exception as e:
-            print(f"Error computing texture: {e}")
-            return np.zeros(19)
-
-    def _compute_entropy(self, image):
-        """Вычисление энтропии изображения"""
-        hist, _ = np.histogram(image, bins=256, range=[0, 256])
-        hist = hist[hist > 0]
-        prob = hist / np.sum(hist)
-        entropy = -np.sum(prob * np.log2(prob))
-        return entropy
+            print(f"Error extracting simple features: {e}")
+            return np.zeros(64, dtype=np.float32)
 
 
 class SimpleDetector:
@@ -287,17 +228,17 @@ class SimpleDetector:
 
         crop = image[y:y + h, x:x + w]
         if crop.size == 0:
-            return np.random.randn(512).astype(np.float32) * 0.1
+            return np.zeros(64, dtype=np.float32)
 
         try:
-            crop_resized = cv2.resize(crop, (64, 128))
+            crop_resized = cv2.resize(crop, (32, 64))
             if len(crop_resized.shape) == 3:
-                feature = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+                feature_img = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
             else:
-                feature = crop_resized
+                feature_img = crop_resized
 
-            feature = cv2.resize(feature, (32, 64))
-            feature = feature.flatten()
+            feature_img = cv2.normalize(feature_img, None, 0, 255, cv2.NORM_MINMAX)
+            feature = feature_img.flatten()
 
             feature_norm = np.linalg.norm(feature)
             if feature_norm > 0:
@@ -305,13 +246,13 @@ class SimpleDetector:
             else:
                 feature = np.zeros_like(feature)
 
-            if len(feature) < 512:
-                feature = np.pad(feature, (0, 512 - len(feature)))
-            elif len(feature) > 512:
-                feature = feature[:512]
+            if len(feature) < 64:
+                feature = np.pad(feature, (0, 64 - len(feature)))
+            elif len(feature) > 64:
+                feature = feature[:64]
 
         except Exception as e:
-            feature = np.random.randn(512).astype(np.float32) * 0.1
+            feature = np.zeros(64, dtype=np.float32)
 
         return feature.astype(np.float32)
 
