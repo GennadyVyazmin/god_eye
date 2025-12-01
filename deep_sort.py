@@ -98,6 +98,7 @@ class Track:
         self.time_since_update = 0
         if self.state == 'tentative' and self.hits >= self._n_init:
             self.state = 'confirmed'
+        print(f"    Track {self.track_id} updated: hits={self.hits}, state={self.state}")
 
     def mark_missed(self):
         if self.state == 'tentative':
@@ -137,7 +138,7 @@ class Detection:
 
 
 class NearestNeighborDistanceMetric:
-    def __init__(self, metric, matching_threshold, budget=None):
+    def __init__(self, metric, matching_threshold, budget=100):
         if metric == "cosine":
             self._metric = self._cosine_distance
         elif metric == "euclidean":
@@ -146,38 +147,38 @@ class NearestNeighborDistanceMetric:
             raise ValueError("Invalid metric; must be either 'euclidean' or 'cosine'")
         self.matching_threshold = matching_threshold
         self.budget = budget
-        self.samples = {}
+        self.samples = {}  # track_id -> [features]
 
     def _cosine_distance(self, x, y):
-        """Косинусное расстояние"""
+        """Косинусное расстояние между двумя векторами"""
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
+        # Если векторы 1D, делаем их 2D
         if x.ndim == 1:
             x = x.reshape(1, -1)
         if y.ndim == 1:
             y = y.reshape(1, -1)
 
+        # Нормализация
         x_norm = np.linalg.norm(x, axis=1, keepdims=True)
         y_norm = np.linalg.norm(y, axis=1, keepdims=True)
 
+        # Избегаем деления на ноль
         x_norm[x_norm == 0] = 1e-10
         y_norm[y_norm == 0] = 1e-10
 
         x_normalized = x / x_norm
         y_normalized = y / y_norm
 
+        # Косинусное сходство и расстояние
         cosine_similarity = np.dot(x_normalized, y_normalized.T)
         cosine_distance = 1.0 - cosine_similarity
-        cosine_distance = np.clip(cosine_distance, 0.0, 2.0)
 
-        if cosine_distance.shape == (1, 1):
-            return cosine_distance[0, 0]
-
-        return cosine_distance
+        return cosine_distance[0, 0] if cosine_distance.shape == (1, 1) else cosine_distance
 
     def _euclidean_distance(self, x, y):
-        """Евклидово расстояние (проще и стабильнее для геометрических фич)"""
+        """Евклидово расстояние между двумя векторами"""
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
@@ -186,46 +187,56 @@ class NearestNeighborDistanceMetric:
         if y.ndim == 1:
             y = y.reshape(1, -1)
 
-        # Простое евклидово расстояние БЕЗ нормализации
+        # Евклидово расстояние
         dist = np.sqrt(np.sum((x - y) ** 2, axis=1))
-
-        # Для нормализованных векторов (norm=1), максимальное расстояние = 2.0
-        # Но так как наши фичи могут быть не идеально нормализованы, используем прямое расстояние
 
         return dist[0] if dist.shape == (1,) else dist
 
     def partial_fit(self, features, targets, active_targets):
+        """Добавляет фичи для указанных треков"""
         for feature, target in zip(features, targets):
-            self.samples.setdefault(target, []).append(feature)
-            if self.budget is not None:
+            if target not in self.samples:
+                self.samples[target] = []
+            self.samples[target].append(feature)
+
+            # Ограничиваем количество хранимых фич
+            if self.budget is not None and len(self.samples[target]) > self.budget:
                 self.samples[target] = self.samples[target][-self.budget:]
-        self.samples = {k: self.samples[k] for k in active_targets}
+
+        # Удаляем фичи неактивных треков
+        self.samples = {k: v for k, v in self.samples.items() if k in active_targets}
 
     def distance(self, features, targets):
         """
-        Вычисление матрицы расстояний
+        Вычисление матрицы расстояний между фичами детекций и треков
         """
-        if len(features) == 0 or len(targets) == 0:
-            return np.zeros((len(features), len(targets)), dtype=np.float32)
+        cost_matrix = np.ones((len(features), len(targets)), dtype=np.float32) * 1e+5
 
-        cost_matrix = np.zeros((len(features), len(targets)), dtype=np.float32)
+        if len(features) == 0 or len(targets) == 0:
+            return cost_matrix
 
         for i, feature in enumerate(features):
             for j, target in enumerate(targets):
                 if target in self.samples and len(self.samples[target]) > 0:
-                    # Берем последнюю фичу трека
-                    target_feature = self.samples[target][-1]
-                    dist = self._metric(feature, target_feature)
-                    cost_matrix[i, j] = dist
-                    # ДЕБАГ: логируем расстояния
-                    if dist < 0.3:  # Только близкие расстояния
-                        print(f"      Distance Detection {i} -> Track {target}: {dist:.3f}")
+                    # Используем среднее из последних 3 фич трека
+                    track_features = self.samples[target][-3:]
+                    distances = []
+                    for track_feature in track_features:
+                        dist = self._metric(feature, track_feature)
+                        distances.append(dist)
+
+                    # Используем минимальное расстояние
+                    min_dist = np.min(distances) if distances else 1.0
+                    cost_matrix[i, j] = min_dist
+
+                    # DEBUG
+                    if min_dist < 0.5:
+                        print(f"      Distance Detection {i} -> Track {target}: {min_dist:.3f}")
                 else:
-                    cost_matrix[i, j] = 1.0  # Максимальная дистанция
+                    # Новый трек или трек без фич
+                    cost_matrix[i, j] = 0.5  # Среднее расстояние для новых треков
 
         return cost_matrix
-
-
 
 
 class Tracker:
@@ -237,168 +248,187 @@ class Tracker:
         self.kf = KalmanFilter()
         self.tracks = []
         self._next_id = 1
+        self.frame_count = 0
 
     def predict(self):
+        """Прогноз положения всех треков"""
         for track in self.tracks:
             track.predict(self.kf)
 
     def update(self, detections):
-        """Perform measurement update and track management."""
+        """Обновление треков с новыми детекциями"""
         try:
-            # Валидация входных данных
-            if detections is None:
-                detections = []
+            self.frame_count += 1
+            print(f"\n  [Tracker] Frame {self.frame_count}, Detections: {len(detections)}")
 
-            # Run matching cascade.
-            matches, unmatched_tracks, unmatched_detections = self._match(detections)
+            if not detections:
+                # Нет детекций - помечаем все треки как пропущенные
+                for track in self.tracks:
+                    track.mark_missed()
+                self.tracks = [t for t in self.tracks if not t.is_deleted()]
+                return [], [], []
 
-            # Update track set.
+            # 1. Получаем активные треки
+            confirmed_tracks = []
+            tentative_tracks = []
+
+            for i, track in enumerate(self.tracks):
+                if track.is_confirmed():
+                    confirmed_tracks.append(i)
+                elif track.is_tentative():
+                    tentative_tracks.append(i)
+
+            print(f"  Active tracks: confirmed={len(confirmed_tracks)}, tentative={len(tentative_tracks)}")
+
+            # 2. Собираем фичи активных треков для метрики
+            active_targets = []
+            track_features = []
+            track_ids = []
+
+            for track_idx in confirmed_tracks + tentative_tracks:
+                track = self.tracks[track_idx]
+                if track.features:
+                    active_targets.append(track.track_id)
+                    track_features.append(track.features[-1])  # Последняя фича
+                    track_ids.append(track.track_id)
+
+            # 3. Собираем фичи детекций
+            detection_features = [d.feature for d in detections]
+            detection_indices = list(range(len(detections)))
+
+            # 4. Обновляем метрику с фичами треков
+            if track_features:
+                self.metric.partial_fit(track_features, track_ids, active_targets)
+
+            # 5. Сопоставление детекций с треками
+            matches, unmatched_tracks, unmatched_detections = [], [], []
+
+            if track_ids and detection_features:
+                # Сначала сопоставляем подтвержденные треки
+                if confirmed_tracks:
+                    confirmed_matches, confirmed_unmatched_tracks, unmatched_detections = self._match_tracks(
+                        confirmed_tracks, detection_indices, detections)
+                    matches.extend(confirmed_matches)
+                    unmatched_tracks.extend(confirmed_unmatched_tracks)
+
+                # Затем неподтвержденные треки с оставшимися детекциями
+                if tentative_tracks and unmatched_detections:
+                    tentative_matches, tentative_unmatched_tracks, unmatched_detections = self._match_tracks(
+                        tentative_tracks, unmatched_detections, detections)
+                    matches.extend(tentative_matches)
+                    unmatched_tracks.extend(tentative_unmatched_tracks)
+            else:
+                # Нет активных треков - все детекции новые
+                unmatched_detections = detection_indices
+                unmatched_tracks = confirmed_tracks + tentative_tracks
+
+            # 6. Обновляем совпавшие треки
             for track_idx, detection_idx in matches:
-                # Проверяем валидность индексов
-                if (0 <= track_idx < len(self.tracks) and
-                        0 <= detection_idx < len(detections)):
+                if 0 <= track_idx < len(self.tracks) and 0 <= detection_idx < len(detections):
                     self.tracks[track_idx].update(self.kf, detections[detection_idx])
-                else:
-                    print(f"Invalid match indices: track_idx={track_idx}, detection_idx={detection_idx}")
+                    # Обновляем фичу в метрике
+                    self.metric.partial_fit(
+                        [detections[detection_idx].feature],
+                        [self.tracks[track_idx].track_id],
+                        [self.tracks[track_idx].track_id]
+                    )
 
+            # 7. Помечаем пропущенные треки
             for track_idx in unmatched_tracks:
                 if 0 <= track_idx < len(self.tracks):
                     self.tracks[track_idx].mark_missed()
-                else:
-                    print(f"Invalid unmatched track index: {track_idx}")
 
+            # 8. Создаем новые треки из несовпавших детекций
             for detection_idx in unmatched_detections:
                 if 0 <= detection_idx < len(detections):
                     self._initiate_track(detections[detection_idx])
-                else:
-                    print(f"Invalid unmatched detection index: {detection_idx}")
 
-            # Remove deleted tracks.
+            # 9. Удаляем неактивные треки
             self.tracks = [t for t in self.tracks if not t.is_deleted()]
+
+            # 10. Возвращаем результат
+            confirmed_count = len([t for t in self.tracks if t.is_confirmed()])
+            tentative_count = len([t for t in self.tracks if t.is_tentative()])
+            print(
+                f"  Tracks after update: total={len(self.tracks)}, confirmed={confirmed_count}, tentative={tentative_count}")
+
+            return matches, unmatched_tracks, unmatched_detections
 
         except Exception as e:
             print(f"Error in tracker update: {e}")
             import traceback
             traceback.print_exc()
-            # В случае ошибки просто удаляем невалидные треки
-            self.tracks = [t for t in self.tracks if not t.is_deleted()]
-
-    def _match(self, detections):
-        if len(detections) == 0:
             return [], [], []
 
-        if len(self.tracks) == 0:
-            return [], [], list(range(len(detections)))
+    def _match_tracks(self, track_indices, detection_indices, detections):
+        """Сопоставление треков и детекций"""
+        if not track_indices or not detection_indices:
+            return [], track_indices, detection_indices
 
-        # Разделяем треки на подтвержденные и неподтвержденные
-        confirmed_tracks = []
-        unconfirmed_tracks = []
+        # Получаем фичи детекций
+        detection_features = [detections[i].feature for i in detection_indices]
+        track_ids = [self.tracks[i].track_id for i in track_indices]
 
-        for i, t in enumerate(self.tracks):
-            if t.is_confirmed():
-                confirmed_tracks.append(i)
-            else:
-                unconfirmed_tracks.append(i)
+        # Вычисляем матрицу расстояний
+        cost_matrix = self.metric.distance(detection_features, track_ids)
 
-        # Сопоставляем подтвержденные треки
-        matches_a, unmatched_tracks_a, unmatched_detections = self._linear_assignment(
-            confirmed_tracks, detections)
+        print(f"    Matching {len(detection_indices)} detections with {len(track_indices)} tracks")
+        print(f"    Cost matrix shape: {cost_matrix.shape}")
 
-        # Сопоставляем оставшиеся неподтвержденные треки
-        matches_b, unmatched_tracks_b, unmatched_detections = self._linear_assignment(
-            unconfirmed_tracks, detections, unmatched_detections)
-
-        matches = matches_a + matches_b
-        unmatched_tracks = unmatched_tracks_a + unmatched_tracks_b
-
-        return matches, unmatched_tracks, unmatched_detections
-
-    def _linear_assignment(self, track_indices, detections, unmatched_detections=None):
-        if unmatched_detections is None:
-            unmatched_detections = list(range(len(detections)))
-
-        if len(track_indices) == 0 or len(unmatched_detections) == 0:
-            return [], track_indices, unmatched_detections
-
-        features = [detections[i].feature for i in unmatched_detections]
-        targets = [self.tracks[i].track_id for i in track_indices]
-
-        cost_matrix = self.metric.distance(features, targets)
-
-        # ДЕБАГ: выводим матрицу расстояний
-        print(f"  Matching {len(features)} detections with {len(targets)} tracks")
-        print(f"  Cost matrix shape: {cost_matrix.shape}")
         if cost_matrix.size > 0:
-            min_cost = np.min(cost_matrix)
-            max_cost = np.max(cost_matrix)
-            avg_cost = np.mean(cost_matrix)
-            print(f"  Min cost: {min_cost:.3f}, Max cost: {max_cost:.3f}, Avg cost: {avg_cost:.3f}")
-            print(f"  Matching threshold: {self.metric.matching_threshold}")
+            # Применяем порог
+            cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
 
-            # Выводим всю матрицу
-            print(f"  Cost matrix:")
-            for i in range(cost_matrix.shape[0]):
-                row_str = "    "
-                for j in range(cost_matrix.shape[1]):
-                    row_str += f"{cost_matrix[i, j]:.3f} "
-                print(row_str)
+            # Венгерский алгоритм
+            matches, unmatched_tracks, unmatched_detections = [], [], []
 
-        # Устанавливаем большое значение для расстояний выше порога
-        cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
-
-        matches, unmatched_tracks, unmatched_detections_new = [], [], []
-
-        try:
-            if cost_matrix.size > 0 and cost_matrix.shape[0] > 0 and cost_matrix.shape[1] > 0:
+            if cost_matrix.shape[0] > 0 and cost_matrix.shape[1] > 0:
                 row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-                # Создаем множества для быстрого поиска
-                matched_rows = set(row_indices)
-                matched_cols = set(col_indices)
 
                 # Обрабатываем совпадения
                 for row, col in zip(row_indices, col_indices):
-                    track_idx = track_indices[row]
-                    detection_idx = unmatched_detections[col]
-
-                    # Проверяем индексы на валидность
-                    if (row < len(track_indices) and col < len(unmatched_detections) and
-                            track_idx < len(self.tracks) and detection_idx < len(detections)):
-
-                        if cost_matrix[row, col] <= self.metric.matching_threshold:
-                            matches.append((track_idx, detection_idx))
-                            print(
-                                f"    ✅ MATCHED: Track {self.tracks[track_idx].track_id} -> Detection {detection_idx} (cost: {cost_matrix[row, col]:.3f})")
-                        else:
-                            unmatched_tracks.append(track_idx)
-                            unmatched_detections_new.append(detection_idx)
-                            print(
-                                f"    ❌ NO MATCH: Track {self.tracks[track_idx].track_id} -> Detection {detection_idx} (cost: {cost_matrix[row, col]:.3f} > threshold: {self.metric.matching_threshold})")
+                    if cost_matrix[row, col] <= self.metric.matching_threshold:
+                        matches.append((track_indices[col], detection_indices[row]))
+                        print(
+                            f"    ✅ MATCH: Track {track_ids[col]} -> Detection {detection_indices[row]} (cost: {cost_matrix[row, col]:.3f})")
                     else:
-                        print(f"Invalid indices: track_idx={track_idx}, detection_idx={detection_idx}")
+                        unmatched_tracks.append(track_indices[col])
+                        unmatched_detections.append(detection_indices[row])
 
                 # Несовпавшие треки
-                for i, track_idx in enumerate(track_indices):
-                    if i not in matched_rows:
-                        unmatched_tracks.append(track_idx)
+                matched_cols = set(col_indices)
+                for j in range(len(track_indices)):
+                    if j not in matched_cols:
+                        unmatched_tracks.append(track_indices[j])
 
                 # Несовпавшие детекции
-                for j, detection_idx in enumerate(unmatched_detections):
-                    if j not in matched_cols:
-                        unmatched_detections_new.append(detection_idx)
+                matched_rows = set(row_indices)
+                for i in range(len(detection_indices)):
+                    if i not in matched_rows:
+                        unmatched_detections.append(detection_indices[i])
+            else:
+                unmatched_tracks = track_indices.copy()
+                unmatched_detections = detection_indices.copy()
 
-        except Exception as e:
-            print(f"Error in linear assignment: {e}")
-            # В случае ошибки возвращаем все как несовпавшие
-            unmatched_tracks = track_indices.copy()
-            unmatched_detections_new = unmatched_detections.copy()
+            return matches, unmatched_tracks, unmatched_detections
 
-        return matches, unmatched_tracks, unmatched_detections_new
+        return [], track_indices, detection_indices
 
     def _initiate_track(self, detection):
+        """Создание нового трека из детекции"""
         mean, covariance = self.kf.initiate(detection.to_xyah())
-        self.tracks.append(Track(
+        new_track = Track(
             mean, covariance, self._next_id, self.n_init, self.max_age,
-            detection.feature))
-        print(f"    🆕 NEW TRACK INITIATED: id={self._next_id}")
+            detection.feature
+        )
+        self.tracks.append(new_track)
+
+        # Немедленно добавляем фичу в метрику
+        self.metric.partial_fit(
+            [detection.feature],
+            [self._next_id],
+            [self._next_id]
+        )
+
+        print(f"    🆕 NEW TRACK INITIATED: id={self._next_id}, bbox={detection.tlwh}")
         self._next_id += 1
