@@ -683,16 +683,17 @@ class VideoAnalyticsServer:
         """Инициализация трекера (вызывается при первом кадре)"""
         print("Initializing DeepSORT tracker...")
 
-        # Используем евклидово расстояние с увеличенным порогом
-        self.metric = NearestNeighborDistanceMetric("euclidean", 0.3, budget=50)
+        # Увеличиваем порог для лучшего сопоставления
+        # Для фичей с norm~0.6, расстояние между похожими детекциями должно быть < 0.1
+        self.metric = NearestNeighborDistanceMetric("euclidean", 0.15, budget=50)  # Уменьшили порог до 0.15
 
         self.tracker = Tracker(
             self.metric,
             max_iou_distance=0.9,
-            max_age=30,
-            n_init=3
+            max_age=5,  # Уменьшили до 5 кадров для быстрого удаления
+            n_init=2  # Уменьшили до 2 кадров для быстрого подтверждения
         )
-        print("Tracker initialized with Euclidean distance, threshold=0.3")
+        print("Tracker initialized with Euclidean distance, threshold=0.15")
 
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""

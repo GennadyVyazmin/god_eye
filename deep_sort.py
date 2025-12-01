@@ -294,8 +294,6 @@ class Tracker:
 
             print(
                 f"  [Tracker UPDATE] Active tracks indices: confirmed={confirmed_tracks}, tentative={tentative_tracks}")
-            print(
-                f"  [Tracker UPDATE] Active tracks count: confirmed={len(confirmed_tracks)}, tentative={len(tentative_tracks)}")
 
             # 2. Собираем фичи активных треков для метрики
             active_targets = []
@@ -310,64 +308,55 @@ class Tracker:
                     track_ids.append(track.track_id)
 
             print(f"  [Tracker UPDATE] Track IDs with features: {track_ids}")
-            print(f"  [Tracker UPDATE] Number of track features: {len(track_features)}")
 
             # 3. Собираем фичи детекций
             detection_features = [d.feature for d in detections]
             detection_indices = list(range(len(detections)))
 
-            print(f"  [Tracker UPDATE] Number of detection features: {len(detection_features)}")
+            print(f"  [Tracker UPDATE] Detection indices: {detection_indices}")
 
             # 4. Обновляем метрику с фичами треков
             if track_features:
                 print(f"  [Tracker UPDATE] Updating metric with {len(track_features)} track features")
                 self.metric.partial_fit(track_features, track_ids, active_targets)
-            else:
-                print("  [Tracker UPDATE] No track features to update metric")
 
-            # 5. Сопоставление детекций с треками - ИСПРАВЛЯЕМ ЗДЕСЬ!
+            # 5. Сопоставление детекций с треками - ИСПРАВЛЯЕМ!
             matches, unmatched_tracks, unmatched_detections = [], [], []
 
-            # ВАЖНО: проверяем есть ли что сопоставлять
-            print(
-                f"  [Tracker UPDATE] Checking if matching possible: track_ids={len(track_ids)}, detection_features={len(detection_features)}")
+            print(f"  [Tracker UPDATE] Starting matching process...")
 
+            # Всегда начинаем с того, что все детекции не сопоставлены
+            unmatched_detections = detection_indices.copy()
+
+            # Если есть треки И детекции - пробуем сопоставить
             if track_ids and detection_features:
                 print(
                     f"  [Tracker UPDATE] Will try to match: {len(track_ids)} tracks with {len(detection_features)} detections")
 
-                # Сначала сопоставляем подтвержденные треки
-                if confirmed_tracks:
-                    print(f"  [Tracker UPDATE] Matching confirmed tracks: {confirmed_tracks}")
-                    confirmed_matches, confirmed_unmatched_tracks, unmatched_detections = self._match_tracks(
-                        confirmed_tracks, detection_indices, detections)
-                    matches.extend(confirmed_matches)
-                    unmatched_tracks.extend(confirmed_unmatched_tracks)
-                    print(f"  [Tracker UPDATE] Confirmed matches: {confirmed_matches}")
-                    print(f"  [Tracker UPDATE] Remaining detections after confirmed: {unmatched_detections}")
+                # Объединяем все треки для сопоставления
+                all_track_indices = confirmed_tracks + tentative_tracks
 
-                # Затем неподтвержденные треки с оставшимися детекциями
-                if tentative_tracks and unmatched_detections:
+                if all_track_indices:
                     print(
-                        f"  [Tracker UPDATE] Matching tentative tracks: {tentative_tracks} with remaining detections: {unmatched_detections}")
-                    tentative_matches, tentative_unmatched_tracks, unmatched_detections = self._match_tracks(
-                        tentative_tracks, unmatched_detections, detections)
-                    matches.extend(tentative_matches)
-                    unmatched_tracks.extend(tentative_unmatched_tracks)
-                    print(f"  [Tracker UPDATE] Tentative matches: {tentative_matches}")
-                    print(f"  [Tracker UPDATE] Remaining detections after tentative: {unmatched_detections}")
-                elif tentative_tracks:
-                    print(f"  [Tracker UPDATE] No detections left for tentative tracks")
-                    unmatched_tracks.extend(tentative_tracks)
+                        f"  [Tracker UPDATE] Matching all tracks: {all_track_indices} with detections: {unmatched_detections}")
+                    track_matches, track_unmatched, unmatched_detections = self._match_tracks(
+                        all_track_indices, unmatched_detections, detections)
+                    matches.extend(track_matches)
+                    unmatched_tracks.extend(track_unmatched)
+                    print(f"  [Tracker UPDATE] Matches found: {track_matches}")
+                    print(f"  [Tracker UPDATE] Unmatched tracks after matching: {track_unmatched}")
+                    print(f"  [Tracker UPDATE] Unmatched detections after matching: {unmatched_detections}")
+                else:
+                    print(f"  [Tracker UPDATE] No tracks to match")
+                    unmatched_tracks = []
             else:
-                print(
-                    f"  [Tracker UPDATE] No matching possible: track_ids={len(track_ids)}, detection_features={len(detection_features)}")
+                print(f"  [Tracker UPDATE] No matching possible: no tracks or no detections")
                 unmatched_detections = detection_indices
                 unmatched_tracks = confirmed_tracks + tentative_tracks
 
             print(f"  [Tracker UPDATE] Total matches found: {len(matches)}")
-            print(f"  [Tracker UPDATE] Unmatched tracks: {unmatched_tracks}")
-            print(f"  [Tracker UPDATE] Unmatched detections: {unmatched_detections}")
+            print(f"  [Tracker UPDATE] Final unmatched tracks: {unmatched_tracks}")
+            print(f"  [Tracker UPDATE] Final unmatched detections: {unmatched_detections}")
 
             # 6. Обновляем совпавшие треки
             for track_idx, detection_idx in matches:
@@ -381,24 +370,18 @@ class Tracker:
                         [self.tracks[track_idx].track_id],
                         [self.tracks[track_idx].track_id]
                     )
-                else:
-                    print(f"  [Tracker UPDATE] Invalid match: track_idx={track_idx}, detection_idx={detection_idx}")
 
             # 7. Помечаем пропущенные треки
             for track_idx in unmatched_tracks:
                 if 0 <= track_idx < len(self.tracks):
                     print(f"  [Tracker UPDATE] Marking track {self.tracks[track_idx].track_id} as missed")
                     self.tracks[track_idx].mark_missed()
-                else:
-                    print(f"  [Tracker UPDATE] Invalid unmatched track index: {track_idx}")
 
             # 8. Создаем новые треки из несовпавших детекций
             for detection_idx in unmatched_detections:
                 if 0 <= detection_idx < len(detections):
                     print(f"  [Tracker UPDATE] Creating new track from detection {detection_idx}")
                     self._initiate_track(detections[detection_idx])
-                else:
-                    print(f"  [Tracker UPDATE] Invalid unmatched detection index: {detection_idx}")
 
             # 9. Удаляем неактивные треки
             self.tracks = [t for t in self.tracks if not t.is_deleted()]

@@ -130,16 +130,15 @@ class YOLODetector:
         # Масштабируем для уменьшения нормы
         feature = feature / 2.0  # Теперь значения [0, 0.5]
 
+        # Добавляем небольшую случайность для различимости фич
+        # Без этого одинаковые объекты могут иметь идентичные фичи
+        feature = feature + np.random.normal(0, 0.001, feature.shape)
+
         # Норма должна быть около 0.3-0.8, не 1.0!
         actual_norm = np.linalg.norm(feature)
 
         print(f"    Simple feature: shape={feature.shape}, norm={actual_norm:.3f}, "
               f"values={[f'{v:.3f}' for v in feature]}")
-
-        # Проверяем, что норма не слишком большая
-        if actual_norm > 1.0:
-            print(f"    ⚠️ WARNING: Feature norm too high: {actual_norm:.3f}")
-            feature = feature / actual_norm * 0.5  # Ограничиваем норму до 0.5
 
         return feature.astype(np.float32)
 
