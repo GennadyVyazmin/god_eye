@@ -140,6 +140,8 @@ class NearestNeighborDistanceMetric:
     def __init__(self, metric, matching_threshold, budget=None):
         if metric == "cosine":
             self._metric = self._cosine_distance
+        elif metric == "euclidean":
+            self._metric = self._euclidean_distance
         else:
             raise ValueError("Invalid metric; must be either 'euclidean' or 'cosine'")
         self.matching_threshold = matching_threshold
@@ -147,43 +149,50 @@ class NearestNeighborDistanceMetric:
         self.samples = {}
 
     def _cosine_distance(self, x, y):
-        """
-        КОРРЕКТНОЕ вычисление косинусного расстояния
-        """
+        """Косинусное расстояние"""
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
-        # Обработка разных размерностей
         if x.ndim == 1:
             x = x.reshape(1, -1)
         if y.ndim == 1:
             y = y.reshape(1, -1)
 
-        # Нормализация
         x_norm = np.linalg.norm(x, axis=1, keepdims=True)
         y_norm = np.linalg.norm(y, axis=1, keepdims=True)
 
-        # Избегаем деления на ноль
         x_norm[x_norm == 0] = 1e-10
         y_norm[y_norm == 0] = 1e-10
 
         x_normalized = x / x_norm
         y_normalized = y / y_norm
 
-        # Косинусное сходство
         cosine_similarity = np.dot(x_normalized, y_normalized.T)
-
-        # Косинусное расстояние = 1 - similarity
         cosine_distance = 1.0 - cosine_similarity
-
-        # Убедимся, что расстояние в пределах [0, 2]
         cosine_distance = np.clip(cosine_distance, 0.0, 2.0)
 
-        # Для векторов возвращаем скаляр
         if cosine_distance.shape == (1, 1):
             return cosine_distance[0, 0]
 
         return cosine_distance
+
+    def _euclidean_distance(self, x, y):
+        """Евклидово расстояние (проще и стабильнее для геометрических фич)"""
+        x = np.asarray(x, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        if y.ndim == 1:
+            y = y.reshape(1, -1)
+
+        # Евклидово расстояние
+        dist = np.sqrt(np.sum((x - y) ** 2, axis=1))
+
+        # Нормализуем (максимальное расстояние для нормализованных векторов ~ sqrt(2))
+        dist = dist / np.sqrt(2.0)
+
+        return dist[0] if dist.shape == (1,) else dist
 
     def partial_fit(self, features, targets, active_targets):
         for feature, target in zip(features, targets):
@@ -206,7 +215,11 @@ class NearestNeighborDistanceMetric:
                 if target in self.samples and len(self.samples[target]) > 0:
                     # Берем последнюю фичу трека
                     target_feature = self.samples[target][-1]
-                    cost_matrix[i, j] = self._metric(feature, target_feature)
+                    dist = self._metric(feature, target_feature)
+                    cost_matrix[i, j] = dist
+                    # ДЕБАГ: логируем расстояния
+                    if dist < 0.3:  # Только близкие расстояния
+                        print(f"      Distance Detection {i} -> Track {target}: {dist:.3f}")
                 else:
                     cost_matrix[i, j] = 1.0  # Максимальная дистанция
 
@@ -320,18 +333,21 @@ class Tracker:
             print(f"  Min cost: {min_cost:.3f}, Max cost: {max_cost:.3f}, Avg cost: {avg_cost:.3f}")
             print(f"  Matching threshold: {self.metric.matching_threshold}")
 
-            # Выводим детальные расстояния
+            # Выводим всю матрицу
+            print(f"  Cost matrix:")
             for i in range(cost_matrix.shape[0]):
+                row_str = "    "
                 for j in range(cost_matrix.shape[1]):
-                    if cost_matrix[i, j] < 0.8:  # Только относительно близкие расстояния
-                        print(f"    Detection {unmatched_detections[i]} -> Track {targets[j]}: {cost_matrix[i, j]:.3f}")
+                    row_str += f"{cost_matrix[i, j]:.3f} "
+                print(row_str)
 
+        # Устанавливаем большое значение для расстояний выше порога
         cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
 
         matches, unmatched_tracks, unmatched_detections_new = [], [], []
 
         try:
-            if cost_matrix.size > 0:
+            if cost_matrix.size > 0 and cost_matrix.shape[0] > 0 and cost_matrix.shape[1] > 0:
                 row_indices, col_indices = linear_sum_assignment(cost_matrix)
 
                 # Создаем множества для быстрого поиска
