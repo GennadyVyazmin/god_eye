@@ -325,10 +325,13 @@ class Tracker:
             else:
                 print("  [Tracker UPDATE] No track features to update metric")
 
-            # 5. Сопоставление детекций с треками
+            # 5. Сопоставление детекций с треками - ИСПРАВЛЯЕМ ЗДЕСЬ!
             matches, unmatched_tracks, unmatched_detections = [], [], []
 
             # ВАЖНО: проверяем есть ли что сопоставлять
+            print(
+                f"  [Tracker UPDATE] Checking if matching possible: track_ids={len(track_ids)}, detection_features={len(detection_features)}")
+
             if track_ids and detection_features:
                 print(
                     f"  [Tracker UPDATE] Will try to match: {len(track_ids)} tracks with {len(detection_features)} detections")
@@ -341,6 +344,7 @@ class Tracker:
                     matches.extend(confirmed_matches)
                     unmatched_tracks.extend(confirmed_unmatched_tracks)
                     print(f"  [Tracker UPDATE] Confirmed matches: {confirmed_matches}")
+                    print(f"  [Tracker UPDATE] Remaining detections after confirmed: {unmatched_detections}")
 
                 # Затем неподтвержденные треки с оставшимися детекциями
                 if tentative_tracks and unmatched_detections:
@@ -351,6 +355,10 @@ class Tracker:
                     matches.extend(tentative_matches)
                     unmatched_tracks.extend(tentative_unmatched_tracks)
                     print(f"  [Tracker UPDATE] Tentative matches: {tentative_matches}")
+                    print(f"  [Tracker UPDATE] Remaining detections after tentative: {unmatched_detections}")
+                elif tentative_tracks:
+                    print(f"  [Tracker UPDATE] No detections left for tentative tracks")
+                    unmatched_tracks.extend(tentative_tracks)
             else:
                 print(
                     f"  [Tracker UPDATE] No matching possible: track_ids={len(track_ids)}, detection_features={len(detection_features)}")
@@ -411,7 +419,7 @@ class Tracker:
 
     def _match_tracks(self, track_indices, detection_indices, detections):
         """Сопоставление треков и детекций"""
-        print(f"    [_match_tracks] track_indices={track_indices}, detection_indices={detection_indices}")
+        print(f"    [_match_tracks] START: track_indices={track_indices}, detection_indices={detection_indices}")
 
         if not track_indices or not detection_indices:
             print(f"    [_match_tracks] No tracks or detections to match")
@@ -425,6 +433,7 @@ class Tracker:
         print(f"    [_match_tracks] Number of detection features: {len(detection_features)}")
 
         # Вычисляем матрицу расстояний
+        print(f"    [_match_tracks] Calling metric.distance...")
         cost_matrix = self.metric.distance(detection_features, track_ids)
 
         print(f"    [_match_tracks] Cost matrix shape: {cost_matrix.shape}")
@@ -441,6 +450,7 @@ class Tracker:
 
             if cost_matrix.shape[0] > 0 and cost_matrix.shape[1] > 0:
                 try:
+                    print(f"    [_match_tracks] Calling linear_sum_assignment...")
                     row_indices, col_indices = linear_sum_assignment(cost_matrix)
                     print(f"    [_match_tracks] Assignment result: rows={row_indices}, cols={col_indices}")
 
