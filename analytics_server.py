@@ -41,12 +41,12 @@ class VideoAnalyticsServer:
         print("Initializing DeepSORT tracker...")
         # ОПТИМИЗИРОВАННЫЕ параметры для простых геометрических фич
         # Используем евклидово расстояние для геометрических фич
-        self.metric = NearestNeighborDistanceMetric("euclidean", 0.3)  # Евклидово расстояние, порог 0.3
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.7)  # Увеличенный порог
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.9,  # Большой порог для лучшего сопоставления
-            max_age=30,  # Для стабильного трекинга
-            n_init=2  # Всего 2 кадра для подтверждения
+            max_iou_distance=0.9,
+            max_age=30,
+            n_init=2  # Уменьшить до 2 для быстрого подтверждения
         )
 
         # Видео поток
