@@ -114,7 +114,6 @@ class Track:
     def is_deleted(self):
         return self.state == 'deleted'
 
-    # ДОБАВЛЕН МЕТОД ДЛЯ ДЕБАГГИНГА
     def __repr__(self):
         return f"Track(id={self.track_id}, state={self.state}, hits={self.hits}, age={self.age})"
 
@@ -148,20 +147,43 @@ class NearestNeighborDistanceMetric:
         self.samples = {}
 
     def _cosine_distance(self, x, y):
+        """
+        КОРРЕКТНОЕ вычисление косинусного расстояния
+        """
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
+
+        # Обработка разных размерностей
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        if y.ndim == 1:
+            y = y.reshape(1, -1)
 
         # Нормализация
         x_norm = np.linalg.norm(x, axis=1, keepdims=True)
         y_norm = np.linalg.norm(y, axis=1, keepdims=True)
 
+        # Избегаем деления на ноль
         x_norm[x_norm == 0] = 1e-10
         y_norm[y_norm == 0] = 1e-10
 
-        x = x / x_norm
-        y = y / y_norm
+        x_normalized = x / x_norm
+        y_normalized = y / y_norm
 
-        return 1. - np.dot(x, y.T)
+        # Косинусное сходство
+        cosine_similarity = np.dot(x_normalized, y_normalized.T)
+
+        # Косинусное расстояние = 1 - similarity
+        cosine_distance = 1.0 - cosine_similarity
+
+        # Убедимся, что расстояние в пределах [0, 2]
+        cosine_distance = np.clip(cosine_distance, 0.0, 2.0)
+
+        # Для векторов возвращаем скаляр
+        if cosine_distance.shape == (1, 1):
+            return cosine_distance[0, 0]
+
+        return cosine_distance
 
     def partial_fit(self, features, targets, active_targets):
         for feature, target in zip(features, targets):
@@ -171,13 +193,23 @@ class NearestNeighborDistanceMetric:
         self.samples = {k: self.samples[k] for k in active_targets}
 
     def distance(self, features, targets):
+        """
+        Вычисление матрицы расстояний
+        """
+        if len(features) == 0 or len(targets) == 0:
+            return np.zeros((len(features), len(targets)), dtype=np.float32)
+
         cost_matrix = np.zeros((len(features), len(targets)), dtype=np.float32)
+
         for i, feature in enumerate(features):
             for j, target in enumerate(targets):
                 if target in self.samples and len(self.samples[target]) > 0:
-                    cost_matrix[i, j] = self._metric([feature], self.samples[target])[0]
+                    # Берем последнюю фичу трека
+                    target_feature = self.samples[target][-1]
+                    cost_matrix[i, j] = self._metric(feature, target_feature)
                 else:
                     cost_matrix[i, j] = 1.0  # Максимальная дистанция
+
         return cost_matrix
 
 
