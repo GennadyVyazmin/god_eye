@@ -115,10 +115,9 @@ class VideoAnalyticsServer:
         @self.socketio.on('disconnect')
         def handle_disconnect():
             self.clients_connected = max(0, self.clients_connected - 1)
-            print(f'Client disconnected. Total clients: {self.clients_connected}')
+            print(f'Client disconnected. Total clients: {self.clients_connected}')  # ИСПРАВЛЕНО: закрыта кавычка
 
-                  @ self.socketio.on('start_stream')
-
+        @self.socketio.on('start_stream')
         def handle_start_stream():
             print("WebSocket: Start stream requested by client")
             self._start_websocket_stream()
