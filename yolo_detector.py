@@ -71,7 +71,7 @@ class YOLODetector:
 
                             # Фильтруем слишком маленькие детекции
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_simple_geometric_feature(image, bbox)
+                                feature = self._extract_simple_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -91,7 +91,7 @@ class YOLODetector:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_simple_geometric_feature(image, bbox)
+                                feature = self._extract_simple_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -105,9 +105,10 @@ class YOLODetector:
             print(f"Error in YOLO detection: {e}")
             return []
 
-    def _extract_simple_geometric_feature(self, image, bbox):
+    def _extract_simple_feature(self, image, bbox):
         """
-        Упрощенные геометрические фичи для лучшего трекинга
+        ПРОСТЫЕ геометрические фичи БЕЗ избыточной нормализации
+        Только 4 основных параметра для стабильного трекинга
         """
         x, y, w, h = [int(coord) for coord in bbox]
 
@@ -118,66 +119,81 @@ class YOLODetector:
         w = max(10, min(w, w_img - x))
         h = max(20, min(h, h_img - y))
 
-        # Базовые геометрические фичи (8 фич)
+        # Всего 4 фичи - центр и размер (относительные)
         feature = np.array([
-            x / w_img,  # относительная позиция X [0, 1]
-            y / h_img,  # относительная позиция Y [0, 1]
-            (x + w / 2) / w_img,  # центр по X [0, 1]
-            (y + h / 2) / h_img,  # центр по Y [0, 1]
-            w / w_img,  # относительная ширина [0, 1]
-            h / h_img,  # относительная высота [0, 1]
-            w / h if h > 0 else 1.0,  # соотношение сторон
-            (w * h) / (w_img * h_img)  # относительная площадь [0, 1]
+            (x + w / 2) / w_img,  # центр X [0, 1]
+            (y + h / 2) / h_img,  # центр Y [0, 1]
+            w / w_img,  # ширина [0, 1]
+            h / h_img  # высота [0, 1]
         ], dtype=np.float32)
 
-        # Простые цветовые характеристики
-        try:
-            # Берем средний цвет из центральной части
-            center_x = x + w // 2
-            center_y = y + h // 2
-            size = min(20, w // 4, h // 4)
+        # Масштабируем для уменьшения нормы
+        feature = feature / 2.0  # Теперь значения [0, 0.5]
 
-            x1 = max(0, center_x - size)
-            y1 = max(0, center_y - size)
-            x2 = min(w_img, center_x + size)
-            y2 = min(h_img, center_y + size)
-
-            if x2 > x1 and y2 > y1:
-                crop = image[y1:y2, x1:x2]
-                if crop.size > 0:
-                    # Средний цвет в HSV
-                    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                    mean_color = np.mean(hsv, axis=(0, 1))
-                    # Нормализуем
-                    mean_color = mean_color / np.array([180, 255, 255], dtype=np.float32)
-                    feature = np.concatenate([feature, mean_color])
-        except:
-            pass
-
-        # Добиваем до 16 фич если нужно
-        if len(feature) < 16:
-            feature = np.pad(feature, (0, 16 - len(feature)))
-        elif len(feature) > 16:
-            feature = feature[:16]
-
-        # L2 нормализация
-        feature_norm = np.linalg.norm(feature)
-        if feature_norm > 0:
-            feature = feature / feature_norm
-        else:
-            # Равномерный вектор единичной длины
-            feature = np.ones(16, dtype=np.float32) / np.sqrt(16)
-
-        # Проверка нормализации
+        # Норма должна быть около 0.3-0.8, не 1.0!
         actual_norm = np.linalg.norm(feature)
-        if abs(actual_norm - 1.0) > 0.01:
-            # Пересчитываем если норма не 1.0
-            feature = feature / actual_norm if actual_norm > 0 else feature
 
-        print(f"    Feature: shape={feature.shape}, norm={np.linalg.norm(feature):.6f}, "
-              f"mean={np.mean(feature):.3f}, std={np.std(feature):.3f}")
+        print(f"    Simple feature: shape={feature.shape}, norm={actual_norm:.3f}, "
+              f"values={[f'{v:.3f}' for v in feature]}")
+
+        # Проверяем, что норма не слишком большая
+        if actual_norm > 1.0:
+            print(f"    ⚠️ WARNING: Feature norm too high: {actual_norm:.3f}")
+            feature = feature / actual_norm * 0.5  # Ограничиваем норму до 0.5
 
         return feature.astype(np.float32)
+
+    def _extract_color_based_feature(self, image, bbox):
+        """
+        Альтернатива: фичи на основе цвета (может быть стабильнее)
+        """
+        x, y, w, h = [int(coord) for coord in bbox]
+
+        h_img, w_img = image.shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(10, min(w, w_img - x))
+        h = max(20, min(h, h_img - y))
+
+        crop = image[y:y + h, x:x + w]
+        if crop.size == 0:
+            return np.zeros(8, dtype=np.float32)
+
+        try:
+            # Ресайз к маленькому размеру
+            crop_resized = cv2.resize(crop, (32, 64))
+
+            # Конвертация в HSV
+            hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
+
+            # Разделяем каналы
+            h_channel, s_channel, v_channel = cv2.split(hsv)
+
+            # Простые статистики
+            mean_h = np.mean(h_channel) / 180.0
+            mean_s = np.mean(s_channel) / 255.0
+            mean_v = np.mean(v_channel) / 255.0
+            std_h = np.std(h_channel) / 180.0
+            std_s = np.std(s_channel) / 255.0
+            std_v = np.std(v_channel) / 255.0
+
+            # Формируем фичу
+            feature = np.array([
+                mean_h, mean_s, mean_v,
+                std_h, std_s, std_v,
+                w / h, w / w_img
+            ], dtype=np.float32)
+
+            # Масштабируем
+            feature = feature / 2.0
+
+            print(f"    Color feature: shape={feature.shape}, norm={np.linalg.norm(feature):.3f}")
+
+            return feature.astype(np.float32)
+
+        except Exception as e:
+            print(f"Error in color feature extraction: {e}")
+            return np.zeros(8, dtype=np.float32)
 
 
 class SimpleDetector:
@@ -211,10 +227,12 @@ class SimpleDetector:
                         # Простая геометрическая фича
                         h_img, w_img = image.shape[:2]
                         feature = np.array([
-                            x / w_img, y / h_img,
-                            w / w_img, h / h_img,
-                            w / h
+                            (x + w / 2) / w_img,
+                            (y + h / 2) / h_img,
+                            w / w_img,
+                            h / h_img
                         ], dtype=np.float32)
+                        feature = feature / 2.0
                         detections.append({
                             'bbox': bbox,
                             'confidence': confidence,

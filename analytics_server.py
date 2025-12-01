@@ -680,16 +680,18 @@ class VideoAnalyticsServer:
     def _init_tracker(self):
         """Инициализация трекера (вызывается при первом кадре)"""
         print("Initializing DeepSORT tracker...")
-        # ОПТИМИЗИРОВАННЫЕ параметры для лучшего трекинга
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.4, budget=50)  # Порог 0.4, храним 50 фич
+
+        # Используем евклидово расстояние с увеличенным порогом
+        # Для 4-мерных векторов со значениями [0, 0.5], макс расстояние = 1.0
+        self.metric = NearestNeighborDistanceMetric("euclidean", 0.3, budget=50)
 
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.8,  # Порог IoU
-            max_age=15,  # Трек живет 15 кадров без обновлений
-            n_init=3  # 3 кадра для подтверждения трека
+            max_iou_distance=0.9,  # Большой порог IoU для лучшего сопоставления
+            max_age=30,  # 30 кадров без обновлений
+            n_init=3  # 3 кадра для подтверждения
         )
-        print("Tracker initialized")
+        print("Tracker initialized with Euclidean distance, threshold=0.3")
 
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""

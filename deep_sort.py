@@ -154,7 +154,6 @@ class NearestNeighborDistanceMetric:
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
-        # Если векторы 1D, делаем их 2D
         if x.ndim == 1:
             x = x.reshape(1, -1)
         if y.ndim == 1:
@@ -164,21 +163,20 @@ class NearestNeighborDistanceMetric:
         x_norm = np.linalg.norm(x, axis=1, keepdims=True)
         y_norm = np.linalg.norm(y, axis=1, keepdims=True)
 
-        # Избегаем деления на ноль
         x_norm[x_norm == 0] = 1e-10
         y_norm[y_norm == 0] = 1e-10
 
         x_normalized = x / x_norm
         y_normalized = y / y_norm
 
-        # Косинусное сходство и расстояние
+        # Косинусное расстояние
         cosine_similarity = np.dot(x_normalized, y_normalized.T)
         cosine_distance = 1.0 - cosine_similarity
 
         return cosine_distance[0, 0] if cosine_distance.shape == (1, 1) else cosine_distance
 
     def _euclidean_distance(self, x, y):
-        """Евклидово расстояние между двумя векторами"""
+        """Упрощенное евклидово расстояние"""
         x = np.asarray(x, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
@@ -187,8 +185,11 @@ class NearestNeighborDistanceMetric:
         if y.ndim == 1:
             y = y.reshape(1, -1)
 
-        # Евклидово расстояние
+        # Простое евклидово расстояние
         dist = np.sqrt(np.sum((x - y) ** 2, axis=1))
+
+        # Для 4-мерных векторов с значениями [0, 0.5]
+        # Максимальное расстояние = sqrt(4 * 0.5^2) = sqrt(1.0) = 1.0
 
         return dist[0] if dist.shape == (1,) else dist
 
@@ -218,23 +219,17 @@ class NearestNeighborDistanceMetric:
         for i, feature in enumerate(features):
             for j, target in enumerate(targets):
                 if target in self.samples and len(self.samples[target]) > 0:
-                    # Используем среднее из последних 3 фич трека
-                    track_features = self.samples[target][-3:]
-                    distances = []
-                    for track_feature in track_features:
-                        dist = self._metric(feature, track_feature)
-                        distances.append(dist)
+                    # Используем последнюю фичу трека
+                    track_feature = self.samples[target][-1]
+                    dist = self._metric(feature, track_feature)
+                    cost_matrix[i, j] = dist
 
-                    # Используем минимальное расстояние
-                    min_dist = np.min(distances) if distances else 1.0
-                    cost_matrix[i, j] = min_dist
-
-                    # DEBUG
-                    if min_dist < 0.5:
-                        print(f"      Distance Detection {i} -> Track {target}: {min_dist:.3f}")
+                    # DEBUG: логируем маленькие расстояния
+                    if dist < self.matching_threshold:
+                        print(f"      Distance Detection {i} -> Track {target}: {dist:.3f} < {self.matching_threshold}")
                 else:
-                    # Новый трек или трек без фич
-                    cost_matrix[i, j] = 0.5  # Среднее расстояние для новых треков
+                    # Новый трек или трек без фич - среднее расстояние
+                    cost_matrix[i, j] = self.matching_threshold / 2.0
 
         return cost_matrix
 
@@ -394,6 +389,8 @@ class Tracker:
                     else:
                         unmatched_tracks.append(track_indices[col])
                         unmatched_detections.append(detection_indices[row])
+                        print(
+                            f"    ❌ NO MATCH: Track {track_ids[col]} -> Detection {detection_indices[row]} (cost: {cost_matrix[row, col]:.3f} > {self.metric.matching_threshold})")
 
                 # Несовпавшие треки
                 matched_cols = set(col_indices)
