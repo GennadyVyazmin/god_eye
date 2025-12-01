@@ -1,386 +1,307 @@
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
-from typing import List, Tuple
 import cv2
-import scipy.linalg
+import numpy as np
+from PIL import Image
+import time
+import os
 
 
-class KalmanFilter:
-    def __init__(self):
-        self._motion_mat = np.eye(8, 8)
-        for i in range(4):
-            self._motion_mat[i, i + 4] = 1
-        self._update_mat = np.eye(4, 8)
-        self._std_weight_position = 1. / 20
-        self._std_weight_velocity = 1. / 160
+class YOLODetector:
+    def __init__(self, conf_threshold=0.5, nms_threshold=0.4):
+        self.conf_threshold = conf_threshold
+        self.nms_threshold = nms_threshold
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
 
-    def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        mean = np.r_[measurement, np.zeros_like(measurement)]
-        std = [
-            2 * self._std_weight_position * measurement[3],
-            2 * self._std_weight_position * measurement[3],
-            1e-2,
-            2 * self._std_weight_position * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
-            1e-5,
-            10 * self._std_weight_velocity * measurement[3]]
-        covariance = np.diag(np.square(std))
-        return mean, covariance
-
-    def predict(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        std_pos = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
-            1e-2,
-            self._std_weight_position * mean[3]]
-        std_vel = [
-            self._std_weight_velocity * mean[3],
-            self._std_weight_velocity * mean[3],
-            1e-5,
-            self._std_weight_velocity * mean[3]]
-        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
-        mean = np.dot(self._motion_mat, mean)
-        covariance = np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
-        return mean, covariance
-
-    def project(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        std = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
-            1e-1,
-            self._std_weight_position * mean[3]]
-        innovation_cov = np.diag(np.square(std))
-        mean = np.dot(self._update_mat, mean)
-        covariance = np.linalg.multi_dot((self._update_mat, covariance, self._update_mat.T))
-        return mean, covariance + innovation_cov
-
-    def update(self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray) -> Tuple[
-        np.ndarray, np.ndarray]:
-        projected_mean, projected_cov = self.project(mean, covariance)
-        chol_factor, lower = scipy.linalg.cho_factor(projected_cov, lower=True, check_finite=False)
-        kalman_gain = scipy.linalg.cho_solve((chol_factor, lower),
-                                             np.dot(covariance, self._update_mat.T).T,
-                                             check_finite=False).T
-        innovation = measurement - projected_mean
-        new_mean = mean + np.dot(innovation, kalman_gain.T)
-        new_covariance = covariance - np.linalg.multi_dot((kalman_gain, projected_cov, kalman_gain.T))
-        return new_mean, new_covariance
-
-
-class Track:
-    def __init__(self, mean, covariance, track_id, n_init, max_age, feature=None):
-        self.mean = mean
-        self.covariance = covariance
-        self.track_id = track_id
-        self.hits = 1
-        self.age = 1
-        self.time_since_update = 0
-        self.state = 'tentative' if n_init > 0 else 'confirmed'
-        self.features = []
-        if feature is not None:
-            self.features.append(feature)
-        self._n_init = n_init
-        self._max_age = max_age
-
-    def predict(self, kf):
-        self.mean, self.covariance = kf.predict(self.mean, self.covariance)
-        self.age += 1
-        self.time_since_update += 1
-
-    def update(self, kf, detection):
-        self.mean, self.covariance = kf.update(self.mean, self.covariance, detection.to_xyah())
-        self.features.append(detection.feature)
-        self.hits += 1
-        self.time_since_update = 0
-        if self.state == 'tentative' and self.hits >= self._n_init:
-            self.state = 'confirmed'
-
-    def mark_missed(self):
-        if self.state == 'tentative':
-            self.state = 'deleted'
-        elif self.time_since_update > self._max_age:
-            self.state = 'deleted'
-
-    def is_tentative(self):
-        return self.state == 'tentative'
-
-    def is_confirmed(self):
-        return self.state == 'confirmed'
-
-    def is_deleted(self):
-        return self.state == 'deleted'
-
-    def __repr__(self):
-        return f"Track(id={self.track_id}, state={self.state}, hits={self.hits}, age={self.age})"
-
-
-class Detection:
-    def __init__(self, tlwh, confidence, feature):
-        self.tlwh = np.asarray(tlwh, dtype=np.float64)
-        self.confidence = float(confidence)
-        self.feature = np.asarray(feature, dtype=np.float32)
-
-    def to_tlbr(self):
-        ret = self.tlwh.copy()
-        ret[2:] += ret[:2]
-        return ret
-
-    def to_xyah(self):
-        ret = self.tlwh.copy()
-        ret[:2] += ret[2:] / 2
-        ret[2] /= ret[3]
-        return ret
-
-
-class NearestNeighborDistanceMetric:
-    def __init__(self, metric, matching_threshold, budget=None):
-        if metric == "cosine":
-            self._metric = self._cosine_distance
-        else:
-            raise ValueError("Invalid metric; must be either 'euclidean' or 'cosine'")
-        self.matching_threshold = matching_threshold
-        self.budget = budget
-        self.samples = {}
-
-    def _cosine_distance(self, x, y):
-        """
-        КОРРЕКТНОЕ вычисление косинусного расстояния
-        """
-        x = np.asarray(x, dtype=np.float32)
-        y = np.asarray(y, dtype=np.float32)
-
-        # Обработка разных размерностей
-        if x.ndim == 1:
-            x = x.reshape(1, -1)
-        if y.ndim == 1:
-            y = y.reshape(1, -1)
-
-        # Нормализация
-        x_norm = np.linalg.norm(x, axis=1, keepdims=True)
-        y_norm = np.linalg.norm(y, axis=1, keepdims=True)
-
-        # Избегаем деления на ноль
-        x_norm[x_norm == 0] = 1e-10
-        y_norm[y_norm == 0] = 1e-10
-
-        x_normalized = x / x_norm
-        y_normalized = y / y_norm
-
-        # Косинусное сходство
-        cosine_similarity = np.dot(x_normalized, y_normalized.T)
-
-        # Косинусное расстояние = 1 - similarity
-        cosine_distance = 1.0 - cosine_similarity
-
-        # Убедимся, что расстояние в пределах [0, 2]
-        cosine_distance = np.clip(cosine_distance, 0.0, 2.0)
-
-        # Для векторов возвращаем скаляр
-        if cosine_distance.shape == (1, 1):
-            return cosine_distance[0, 0]
-
-        return cosine_distance
-
-    def partial_fit(self, features, targets, active_targets):
-        for feature, target in zip(features, targets):
-            self.samples.setdefault(target, []).append(feature)
-            if self.budget is not None:
-                self.samples[target] = self.samples[target][-self.budget:]
-        self.samples = {k: self.samples[k] for k in active_targets}
-
-    def distance(self, features, targets):
-        """
-        Вычисление матрицы расстояний
-        """
-        if len(features) == 0 or len(targets) == 0:
-            return np.zeros((len(features), len(targets)), dtype=np.float32)
-
-        cost_matrix = np.zeros((len(features), len(targets)), dtype=np.float32)
-
-        for i, feature in enumerate(features):
-            for j, target in enumerate(targets):
-                if target in self.samples and len(self.samples[target]) > 0:
-                    # Берем последнюю фичу трека
-                    target_feature = self.samples[target][-1]
-                    cost_matrix[i, j] = self._metric(feature, target_feature)
-                else:
-                    cost_matrix[i, j] = 1.0  # Максимальная дистанция
-
-        return cost_matrix
-
-
-class Tracker:
-    def __init__(self, metric, max_iou_distance=0.7, max_age=70, n_init=3):
-        self.metric = metric
-        self.max_iou_distance = max_iou_distance
-        self.max_age = max_age
-        self.n_init = n_init
-        self.kf = KalmanFilter()
-        self.tracks = []
-        self._next_id = 1
-
-    def predict(self):
-        for track in self.tracks:
-            track.predict(self.kf)
-
-    def update(self, detections):
-        """Perform measurement update and track management."""
+        # Загрузка модели YOLO
         try:
-            # Валидация входных данных
-            if detections is None:
-                detections = []
+            from ultralytics import YOLO
+            self.model = YOLO('yolov8n.pt')
+            self.model_type = 'ultralytics'
+            print("YOLO model loaded successfully using ultralytics")
 
-            # Run matching cascade.
-            matches, unmatched_tracks, unmatched_detections = self._match(detections)
+        except ImportError:
+            try:
+                self.model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
+                self.model_type = 'torchhub'
+                print("YOLO model loaded successfully using torch.hub")
+            except Exception as e:
+                print(f"Error loading YOLOv5: {e}")
+                self.model = None
+                self.model_type = None
 
-            # Update track set.
-            for track_idx, detection_idx in matches:
-                # Проверяем валидность индексов
-                if (0 <= track_idx < len(self.tracks) and
-                        0 <= detection_idx < len(detections)):
-                    self.tracks[track_idx].update(self.kf, detections[detection_idx])
-                else:
-                    print(f"Invalid match indices: track_idx={track_idx}, detection_idx={detection_idx}")
+        if self.model:
+            if hasattr(self.model, 'conf'):
+                self.model.conf = conf_threshold
+            if hasattr(self.model, 'iou'):
+                self.model.iou = nms_threshold
+            if hasattr(self.model, 'to'):
+                self.model.to(self.device)
 
-            for track_idx in unmatched_tracks:
-                if 0 <= track_idx < len(self.tracks):
-                    self.tracks[track_idx].mark_missed()
-                else:
-                    print(f"Invalid unmatched track index: {track_idx}")
+        self.person_class_id = 0
 
-            for detection_idx in unmatched_detections:
-                if 0 <= detection_idx < len(detections):
-                    self._initiate_track(detections[detection_idx])
-                else:
-                    print(f"Invalid unmatched detection index: {detection_idx}")
+    def detect(self, image):
+        """Детекция людей"""
+        if self.model is None:
+            print("YOLO model not available")
+            return []
 
-            # Remove deleted tracks.
-            self.tracks = [t for t in self.tracks if not t.is_deleted()]
-
-        except Exception as e:
-            print(f"Error in tracker update: {e}")
-            import traceback
-            traceback.print_exc()
-            # В случае ошибки просто удаляем невалидные треки
-            self.tracks = [t for t in self.tracks if not t.is_deleted()]
-
-    def _match(self, detections):
-        if len(detections) == 0:
-            return [], [], []
-
-        if len(self.tracks) == 0:
-            return [], [], list(range(len(detections)))
-
-        # Разделяем треки на подтвержденные и неподтвержденные
-        confirmed_tracks = []
-        unconfirmed_tracks = []
-
-        for i, t in enumerate(self.tracks):
-            if t.is_confirmed():
-                confirmed_tracks.append(i)
+        try:
+            if len(image.shape) == 3 and image.shape[2] == 3:
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             else:
-                unconfirmed_tracks.append(i)
+                image_rgb = image
 
-        # Сопоставляем подтвержденные треки
-        matches_a, unmatched_tracks_a, unmatched_detections = self._linear_assignment(
-            confirmed_tracks, detections)
+            detections = []
 
-        # Сопоставляем оставшиеся неподтвержденные треки
-        matches_b, unmatched_tracks_b, unmatched_detections = self._linear_assignment(
-            unconfirmed_tracks, detections, unmatched_detections)
+            if self.model_type == 'ultralytics':
+                results = self.model(image_rgb, verbose=False)
 
-        matches = matches_a + matches_b
-        unmatched_tracks = unmatched_tracks_a + unmatched_tracks_b
+                if len(results) > 0 and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    for box in boxes:
+                        cls = int(box.cls[0].cpu().numpy())
+                        conf = box.conf[0].cpu().numpy()
 
-        return matches, unmatched_tracks, unmatched_detections
+                        if cls == self.person_class_id and conf >= self.conf_threshold:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
-    def _linear_assignment(self, track_indices, detections, unmatched_detections=None):
-        if unmatched_detections is None:
-            unmatched_detections = list(range(len(detections)))
+                            # Фильтруем слишком маленькие детекции
+                            if bbox[2] > 50 and bbox[3] > 100:
+                                feature = self._extract_stable_feature(image, bbox)
+                                detections.append({
+                                    'bbox': bbox,
+                                    'confidence': float(conf),
+                                    'class': cls,
+                                    'feature': feature
+                                })
+                                print(f"  YOLO detection: bbox={[int(x) for x in bbox]}, conf={conf:.3f}")
 
-        if len(track_indices) == 0 or len(unmatched_detections) == 0:
-            return [], track_indices, unmatched_detections
+            else:  # torchhub
+                results = self.model(image_rgb)
 
-        features = [detections[i].feature for i in unmatched_detections]
-        targets = [self.tracks[i].track_id for i in track_indices]
+                if len(results.xyxy[0]) > 0:
+                    for detection in results.xyxy[0]:
+                        x1, y1, x2, y2, conf, cls = detection.cpu().numpy()
 
-        cost_matrix = self.metric.distance(features, targets)
+                        if int(cls) == self.person_class_id and conf >= self.conf_threshold:
+                            bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
-        # ДЕБАГ: выводим матрицу расстояний
-        print(f"  Matching {len(features)} detections with {len(targets)} tracks")
-        print(f"  Cost matrix shape: {cost_matrix.shape}")
-        if cost_matrix.size > 0:
-            min_cost = np.min(cost_matrix)
-            max_cost = np.max(cost_matrix)
-            avg_cost = np.mean(cost_matrix)
-            print(f"  Min cost: {min_cost:.3f}, Max cost: {max_cost:.3f}, Avg cost: {avg_cost:.3f}")
-            print(f"  Matching threshold: {self.metric.matching_threshold}")
+                            if bbox[2] > 50 and bbox[3] > 100:
+                                feature = self._extract_stable_feature(image, bbox)
+                                detections.append({
+                                    'bbox': bbox,
+                                    'confidence': float(conf),
+                                    'class': int(cls),
+                                    'feature': feature
+                                })
 
-            # Выводим детальные расстояния
-            for i in range(cost_matrix.shape[0]):
-                for j in range(cost_matrix.shape[1]):
-                    if cost_matrix[i, j] < 0.8:  # Только относительно близкие расстояния
-                        print(f"    Detection {unmatched_detections[i]} -> Track {targets[j]}: {cost_matrix[i, j]:.3f}")
-
-        cost_matrix[cost_matrix > self.metric.matching_threshold] = 1e+5
-
-        matches, unmatched_tracks, unmatched_detections_new = [], [], []
-
-        try:
-            if cost_matrix.size > 0:
-                row_indices, col_indices = linear_sum_assignment(cost_matrix)
-
-                # Создаем множества для быстрого поиска
-                matched_rows = set(row_indices)
-                matched_cols = set(col_indices)
-
-                # Обрабатываем совпадения
-                for row, col in zip(row_indices, col_indices):
-                    track_idx = track_indices[row]
-                    detection_idx = unmatched_detections[col]
-
-                    # Проверяем индексы на валидность
-                    if (row < len(track_indices) and col < len(unmatched_detections) and
-                            track_idx < len(self.tracks) and detection_idx < len(detections)):
-
-                        if cost_matrix[row, col] <= self.metric.matching_threshold:
-                            matches.append((track_idx, detection_idx))
-                            print(
-                                f"    ✅ MATCHED: Track {self.tracks[track_idx].track_id} -> Detection {detection_idx} (cost: {cost_matrix[row, col]:.3f})")
-                        else:
-                            unmatched_tracks.append(track_idx)
-                            unmatched_detections_new.append(detection_idx)
-                            print(
-                                f"    ❌ NO MATCH: Track {self.tracks[track_idx].track_id} -> Detection {detection_idx} (cost: {cost_matrix[row, col]:.3f} > threshold: {self.metric.matching_threshold})")
-                    else:
-                        print(f"Invalid indices: track_idx={track_idx}, detection_idx={detection_idx}")
-
-                # Несовпавшие треки
-                for i, track_idx in enumerate(track_indices):
-                    if i not in matched_rows:
-                        unmatched_tracks.append(track_idx)
-
-                # Несовпавшие детекции
-                for j, detection_idx in enumerate(unmatched_detections):
-                    if j not in matched_cols:
-                        unmatched_detections_new.append(detection_idx)
+            return detections
 
         except Exception as e:
-            print(f"Error in linear assignment: {e}")
-            # В случае ошибки возвращаем все как несовпавшие
-            unmatched_tracks = track_indices.copy()
-            unmatched_detections_new = unmatched_detections.copy()
+            print(f"Error in YOLO detection: {e}")
+            return []
 
-        return matches, unmatched_tracks, unmatched_detections_new
+    def _extract_stable_feature(self, image, bbox):
+        """
+        УЛУЧШЕННЫЕ и СТАБИЛЬНЫЕ фичи для трекинга
+        """
+        x, y, w, h = [int(coord) for coord in bbox]
 
-    def _initiate_track(self, detection):
-        mean, covariance = self.kf.initiate(detection.to_xyah())
-        self.tracks.append(Track(
-            mean, covariance, self._next_id, self.n_init, self.max_age,
-            detection.feature))
-        print(f"    🆕 NEW TRACK INITIATED: id={self._next_id}")
-        self._next_id += 1
+        # Проверка границ
+        h_img, w_img = image.shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(10, min(w, w_img - x))
+        h = max(20, min(h, h_img - y))
+
+        # Вырезаем область с человеком
+        crop = image[y:y + h, x:x + w]
+        if crop.size == 0:
+            return np.zeros(64, dtype=np.float32)
+
+        try:
+            # 1. Ресайз к фиксированному размеру
+            crop_resized = cv2.resize(crop, (64, 128))
+
+            # 2. Конвертация в HSV
+            hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
+
+            # 3. Разделяем каналы и вычисляем гистограммы
+            hist_h = cv2.calcHist([hsv], [0], None, [8], [0, 180])
+            hist_s = cv2.calcHist([hsv], [1], None, [4], [0, 256])
+            hist_v = cv2.calcHist([hsv], [2], None, [4], [0, 256])
+
+            # 4. Нормализация гистограмм
+            hist_h = cv2.normalize(hist_h, hist_h).flatten()
+            hist_s = cv2.normalize(hist_s, hist_s).flatten()
+            hist_v = cv2.normalize(hist_v, hist_v).flatten()
+
+            # 5. Градиенты для текстуры
+            gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+
+            # 6. HOG-подобные фичи (упрощенные)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+            # 7. Амплитуда и направление
+            magnitude = np.sqrt(gx ** 2 + gy ** 2)
+            orientation = np.arctan2(gy, gx) * (180 / np.pi)
+
+            # 8. Гистограмма направлений (8 бинов)
+            hist_orient, _ = np.histogram(orientation, bins=8, range=(-180, 180), weights=magnitude)
+            hist_orient = hist_orient / (np.sum(hist_orient) + 1e-10)
+
+            # 9. Статистики
+            mean_intensity = np.mean(gray)
+            std_intensity = np.std(gray)
+
+            # 10. Цвет среднего (устойчивый к освещению)
+            mean_color = np.mean(crop_resized, axis=(0, 1))
+            mean_color = mean_color / (np.linalg.norm(mean_color) + 1e-10)
+
+            # 11. Геометрические фичи (нормализованные)
+            aspect_ratio = w / h
+            relative_size = (w * h) / (w_img * h_img)
+
+            # 12. Формируем фичу
+            feature = np.concatenate([
+                hist_h,  # 8
+                hist_s,  # 4
+                hist_v,  # 4
+                hist_orient,  # 8
+                [mean_intensity, std_intensity],  # 2
+                mean_color,  # 3
+                [aspect_ratio, relative_size]  # 2
+            ])  # Всего: 31 фича
+
+            # 13. L2 нормализация
+            feature_norm = np.linalg.norm(feature)
+            if feature_norm > 0:
+                feature = feature / feature_norm
+
+            # 14. Добиваем до фиксированного размера (64)
+            if len(feature) < 64:
+                feature = np.pad(feature, (0, 64 - len(feature)))
+            elif len(feature) > 64:
+                feature = feature[:64]
+
+            return feature.astype(np.float32)
+
+        except Exception as e:
+            print(f"Error extracting features: {e}")
+            return np.zeros(64, dtype=np.float32)
+
+
+class SimpleDetector:
+    def __init__(self, conf_threshold=0.3):
+        self.conf_threshold = conf_threshold
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+
+        self.fgbg = cv2.createBackgroundSubtractorMOG2(detectShadows=True, history=500, varThreshold=16)
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+        print("Simple motion detector initialized")
+
+    def detect(self, image):
+        """Детекция движения"""
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            fgmask = self.fgbg.apply(gray)
+            fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, self.kernel)
+            contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            detections = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 500:
+                    x, y, w, h = cv2.boundingRect(contour)
+                    confidence = min(area / 5000.0, 1.0)
+
+                    if confidence >= self.conf_threshold:
+                        bbox = [float(x), float(y), float(w), float(h)]
+                        feature = self._extract_feature(image, bbox)
+                        detections.append({
+                            'bbox': bbox,
+                            'confidence': confidence,
+                            'class': 0,
+                            'feature': feature
+                        })
+
+            return detections
+
+        except Exception as e:
+            print(f"Error in motion detection: {e}")
+            return []
+
+    def _extract_feature(self, image, bbox):
+        x, y, w, h = [int(coord) for coord in bbox]
+        h_img, w_img = image.shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(1, min(w, w_img - x))
+        h = max(1, min(h, h_img - y))
+
+        crop = image[y:y + h, x:x + w]
+        if crop.size == 0:
+            return np.zeros(64, dtype=np.float32)
+
+        try:
+            crop_resized = cv2.resize(crop, (32, 64))
+            if len(crop_resized.shape) == 3:
+                feature_img = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
+            else:
+                feature_img = crop_resized
+
+            feature_img = cv2.normalize(feature_img, None, 0, 255, cv2.NORM_MINMAX)
+            feature = feature_img.flatten()
+
+            feature_norm = np.linalg.norm(feature)
+            if feature_norm > 0:
+                feature = feature / feature_norm
+            else:
+                feature = np.zeros_like(feature)
+
+            if len(feature) < 64:
+                feature = np.pad(feature, (0, 64 - len(feature)))
+            elif len(feature) > 64:
+                feature = feature[:64]
+
+        except Exception as e:
+            feature = np.zeros(64, dtype=np.float32)
+
+        return feature.astype(np.float32)
+
+
+class FaceClothingDetector:
+    def __init__(self, use_yolo=True):
+        print("Initializing FaceClothingDetector...")
+
+        if use_yolo:
+            try:
+                self.detector = YOLODetector(conf_threshold=0.5)
+                print("YOLO detector initialized successfully")
+                self.detector_type = "yolo"
+            except Exception as e:
+                print(f"YOLO initialization failed: {e}")
+                print("Using motion detection fallback")
+                self.detector = SimpleDetector()
+                self.detector_type = "motion"
+        else:
+            self.detector = SimpleDetector()
+            self.detector_type = "motion"
+
+        print(f"Using detector: {self.detector_type}")
+
+    def detect_face_and_clothing(self, image):
+        """Детекция людей"""
+        detections = self.detector.detect(image)
+
+        if len(detections) > 0:
+            print(f"Detected {len(detections)} person(s)")
+
+        return detections, []
