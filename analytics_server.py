@@ -39,13 +39,14 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Более мягкие параметры для лучшего сопоставления
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # УВЕЛИЧИЛИ порог до 0.5
+        # ОПТИМИЗИРОВАННЫЕ параметры для простых геометрических фич
+        # Используем евклидово расстояние для геометрических фич
+        self.metric = NearestNeighborDistanceMetric("euclidean", 0.3)  # Евклидово расстояние, порог 0.3
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.7,  # Средний порог
+            max_iou_distance=0.8,  # Большой порог для лучшего сопоставления
             max_age=30,  # Для стабильного трекинга
-            n_init=3  # УМЕНЬШИЛИ для быстрого подтверждения
+            n_init=2  # Всего 2 кадра для подтверждения
         )
 
         # Видео поток
@@ -160,8 +161,7 @@ class VideoAnalyticsServer:
 
                             # Проверяем границы
                             if (x1 >= 0 and y1 >= 0 and x2 <= frame.shape[1] and y2 <= frame.shape[0]):
-                                color = (0, 255, 0) if track.get('state') == 'confirmed' else (255, 165,
-                                                                                               0)  # Зеленый для подтвержденных, оранжевый для временных
+                                color = (0, 255, 0) if track.get('state') == 'confirmed' else (255, 165, 0)
                                 thickness = 3 if track.get('state') == 'confirmed' else 2
 
                                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
