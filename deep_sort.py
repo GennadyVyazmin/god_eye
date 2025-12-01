@@ -225,34 +225,7 @@ class NearestNeighborDistanceMetric:
 
         return cost_matrix
 
-    def _extract_ultra_simple_feature(self, image, bbox):
-        """
-        САМЫЕ ПРОСТЫЕ фичи - только координаты центра
-        """
-        x, y, w, h = [int(coord) for coord in bbox]
 
-        h_img, w_img = image.shape[:2]
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w = max(10, min(w, w_img - x))
-        h = max(20, min(h, h_img - y))
-
-        # ТОЛЬКО координаты центра
-        center_x = (x + w / 2) / w_img
-        center_y = (y + h / 2) / h_img
-
-        feature = np.array([center_x, center_y], dtype=np.float32)
-
-        # Нормализуем
-        feature_norm = np.linalg.norm(feature)
-        if feature_norm > 0:
-            feature = feature / feature_norm
-        else:
-            feature = np.array([1.0, 0.0], dtype=np.float32)
-
-        print(f"    Ultra simple feature: center=({center_x:.3f}, {center_y:.3f}), norm={np.linalg.norm(feature):.6f}")
-
-        return feature
 
 
 class Tracker:
