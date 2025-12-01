@@ -151,15 +151,19 @@ class YOLODetector:
         elif len(feature) > 16:
             feature = feature[:16]
 
-        # L2 нормализация
+        # L2 нормализация - ВАЖНО: ДОЛЖНА БЫТЬ 1.0!
         feature_norm = np.linalg.norm(feature)
         if feature_norm > 0:
             feature = feature / feature_norm
+        else:
+            feature = np.ones(16, dtype=np.float32) / np.sqrt(16)  # равномерный вектор
 
-        # Отладка
-        print(f"    Geometric feature: shape={feature.shape}, norm={feature_norm:.3f}, mean={np.mean(feature):.3f}")
-        if len(self.feature_history) < 10:
-            self.feature_history.append(feature)
+        # Отладка - ПРОВЕРЯЕМ НОРМУ!
+        actual_norm = np.linalg.norm(feature)
+        print(
+            f"    Geometric feature: shape={feature.shape}, norm={actual_norm:.6f} (should be 1.0), mean={np.mean(feature):.6f}")
+        if abs(actual_norm - 1.0) > 0.01:
+            print(f"    ⚠️ WARNING: Feature norm is {actual_norm:.6f}, should be 1.0!")
 
         return feature.astype(np.float32)
 

@@ -44,7 +44,7 @@ class VideoAnalyticsServer:
         self.metric = NearestNeighborDistanceMetric("euclidean", 0.3)  # Евклидово расстояние, порог 0.3
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.8,  # Большой порог для лучшего сопоставления
+            max_iou_distance=0.9,  # Большой порог для лучшего сопоставления
             max_age=30,  # Для стабильного трекинга
             n_init=2  # Всего 2 кадра для подтверждения
         )
