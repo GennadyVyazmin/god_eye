@@ -40,6 +40,7 @@ class YOLODetector:
                 self.model.to(self.device)
 
         self.person_class_id = 0
+        self.feature_history = []  # Для отладки
 
     def detect(self, image):
         """Детекция людей"""
@@ -70,7 +71,7 @@ class YOLODetector:
 
                             # Фильтруем слишком маленькие детекции
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_stable_feature(image, bbox)
+                                feature = self._extract_simple_geometric_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -90,7 +91,7 @@ class YOLODetector:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_stable_feature(image, bbox)
+                                feature = self._extract_simple_geometric_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -104,9 +105,9 @@ class YOLODetector:
             print(f"Error in YOLO detection: {e}")
             return []
 
-    def _extract_stable_feature(self, image, bbox):
+    def _extract_simple_geometric_feature(self, image, bbox):
         """
-        УЛУЧШЕННЫЕ и СТАБИЛЬНЫЕ фичи для трекинга
+        ПРОСТЕЙШИЕ геометрические фичи - самые стабильные!
         """
         x, y, w, h = [int(coord) for coord in bbox]
 
@@ -117,83 +118,116 @@ class YOLODetector:
         w = max(10, min(w, w_img - x))
         h = max(20, min(h, h_img - y))
 
-        # Вырезаем область с человеком
+        # ТОЛЬКО геометрические фичи (нормализованные)
+        feature = np.array([
+            x / w_img,  # относительная позиция X [0, 1]
+            y / h_img,  # относительная позиция Y [0, 1]
+            (x + w / 2) / w_img,  # центр по X [0, 1]
+            (y + h / 2) / h_img,  # центр по Y [0, 1]
+            w / w_img,  # относительная ширина [0, 1]
+            h / h_img,  # относительная высота [0, 1]
+            w / h,  # соотношение сторон
+            (w * h) / (w_img * h_img)  # относительная площадь [0, 1]
+        ], dtype=np.float32)
+
+        # Добавляем простые цветовые фичи
+        try:
+            # Вырезаем небольшую область для цвета
+            crop = image[y:y + h, x:x + w]
+            if crop.size > 0:
+                crop_resized = cv2.resize(crop, (8, 8))  # Очень маленький
+                # Средний цвет в HSV
+                hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
+                mean_color = np.mean(hsv, axis=(0, 1))
+                # Нормализуем
+                mean_color = mean_color / np.array([180, 255, 255], dtype=np.float32)
+                feature = np.concatenate([feature, mean_color])
+        except:
+            pass
+
+        # Добиваем до фиксированного размера (16)
+        if len(feature) < 16:
+            feature = np.pad(feature, (0, 16 - len(feature)))
+        elif len(feature) > 16:
+            feature = feature[:16]
+
+        # L2 нормализация
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm > 0:
+            feature = feature / feature_norm
+
+        # Отладка
+        print(f"    Geometric feature: shape={feature.shape}, norm={feature_norm:.3f}, mean={np.mean(feature):.3f}")
+        if len(self.feature_history) < 10:
+            self.feature_history.append(feature)
+
+        return feature.astype(np.float32)
+
+    def _extract_color_based_feature(self, image, bbox):
+        """
+        Альтернатива: фичи на основе цвета (может быть стабильнее)
+        """
+        x, y, w, h = [int(coord) for coord in bbox]
+
+        h_img, w_img = image.shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(10, min(w, w_img - x))
+        h = max(20, min(h, h_img - y))
+
         crop = image[y:y + h, x:x + w]
         if crop.size == 0:
-            return np.zeros(64, dtype=np.float32)
+            return np.zeros(32, dtype=np.float32)
 
         try:
-            # 1. Ресайз к фиксированному размеру
-            crop_resized = cv2.resize(crop, (64, 128))
+            # Ресайз к маленькому размеру
+            crop_resized = cv2.resize(crop, (32, 64))
 
-            # 2. Конвертация в HSV
+            # Конвертация в HSV
             hsv = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2HSV)
 
-            # 3. Разделяем каналы и вычисляем гистограммы
-            hist_h = cv2.calcHist([hsv], [0], None, [8], [0, 180])
-            hist_s = cv2.calcHist([hsv], [1], None, [4], [0, 256])
-            hist_v = cv2.calcHist([hsv], [2], None, [4], [0, 256])
+            # Разделяем каналы
+            h_channel, s_channel, v_channel = cv2.split(hsv)
 
-            # 4. Нормализация гистограмм
+            # Простые гистограммы
+            hist_h = cv2.calcHist([h_channel], [0], None, [8], [0, 180])
+            hist_s = cv2.calcHist([s_channel], [0], None, [4], [0, 256])
+            hist_v = cv2.calcHist([v_channel], [0], None, [4], [0, 256])
+
+            # Нормализация гистограмм
             hist_h = cv2.normalize(hist_h, hist_h).flatten()
             hist_s = cv2.normalize(hist_s, hist_s).flatten()
             hist_v = cv2.normalize(hist_v, hist_v).flatten()
 
-            # 5. Градиенты для текстуры
-            gray = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
-            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+            # Средние значения
+            mean_h = np.mean(h_channel) / 180.0
+            mean_s = np.mean(s_channel) / 255.0
+            mean_v = np.mean(v_channel) / 255.0
 
-            # 6. HOG-подобные фичи (упрощенные)
-            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-
-            # 7. Амплитуда и направление
-            magnitude = np.sqrt(gx ** 2 + gy ** 2)
-            orientation = np.arctan2(gy, gx) * (180 / np.pi)
-
-            # 8. Гистограмма направлений (8 бинов)
-            hist_orient, _ = np.histogram(orientation, bins=8, range=(-180, 180), weights=magnitude)
-            hist_orient = hist_orient / (np.sum(hist_orient) + 1e-10)
-
-            # 9. Статистики
-            mean_intensity = np.mean(gray)
-            std_intensity = np.std(gray)
-
-            # 10. Цвет среднего (устойчивый к освещению)
-            mean_color = np.mean(crop_resized, axis=(0, 1))
-            mean_color = mean_color / (np.linalg.norm(mean_color) + 1e-10)
-
-            # 11. Геометрические фичи (нормализованные)
-            aspect_ratio = w / h
-            relative_size = (w * h) / (w_img * h_img)
-
-            # 12. Формируем фичу
+            # Формируем фичу
             feature = np.concatenate([
                 hist_h,  # 8
                 hist_s,  # 4
                 hist_v,  # 4
-                hist_orient,  # 8
-                [mean_intensity, std_intensity],  # 2
-                mean_color,  # 3
-                [aspect_ratio, relative_size]  # 2
-            ])  # Всего: 31 фича
+                [mean_h, mean_s, mean_v],  # 3
+                [w / h, w / w_img, h / h_img]  # 3 геометрических
+            ])  # Всего: 22 фичи
 
-            # 13. L2 нормализация
+            # Нормализация
             feature_norm = np.linalg.norm(feature)
             if feature_norm > 0:
                 feature = feature / feature_norm
 
-            # 14. Добиваем до фиксированного размера (64)
-            if len(feature) < 64:
-                feature = np.pad(feature, (0, 64 - len(feature)))
-            elif len(feature) > 64:
-                feature = feature[:64]
+            # Добиваем до 32
+            feature = np.pad(feature, (0, 32 - len(feature)))
+
+            print(f"    Color feature: shape={feature.shape}, norm={feature_norm:.3f}")
 
             return feature.astype(np.float32)
 
         except Exception as e:
-            print(f"Error extracting features: {e}")
-            return np.zeros(64, dtype=np.float32)
+            print(f"Error in color feature extraction: {e}")
+            return np.zeros(32, dtype=np.float32)
 
 
 class SimpleDetector:
@@ -224,7 +258,13 @@ class SimpleDetector:
 
                     if confidence >= self.conf_threshold:
                         bbox = [float(x), float(y), float(w), float(h)]
-                        feature = self._extract_feature(image, bbox)
+                        # Простая геометрическая фича
+                        h_img, w_img = image.shape[:2]
+                        feature = np.array([
+                            x / w_img, y / h_img,
+                            w / w_img, h / h_img,
+                            w / h
+                        ], dtype=np.float32)
                         detections.append({
                             'bbox': bbox,
                             'confidence': confidence,
@@ -237,44 +277,6 @@ class SimpleDetector:
         except Exception as e:
             print(f"Error in motion detection: {e}")
             return []
-
-    def _extract_feature(self, image, bbox):
-        x, y, w, h = [int(coord) for coord in bbox]
-        h_img, w_img = image.shape[:2]
-        x = max(0, min(x, w_img - 1))
-        y = max(0, min(y, h_img - 1))
-        w = max(1, min(w, w_img - x))
-        h = max(1, min(h, h_img - y))
-
-        crop = image[y:y + h, x:x + w]
-        if crop.size == 0:
-            return np.zeros(64, dtype=np.float32)
-
-        try:
-            crop_resized = cv2.resize(crop, (32, 64))
-            if len(crop_resized.shape) == 3:
-                feature_img = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2GRAY)
-            else:
-                feature_img = crop_resized
-
-            feature_img = cv2.normalize(feature_img, None, 0, 255, cv2.NORM_MINMAX)
-            feature = feature_img.flatten()
-
-            feature_norm = np.linalg.norm(feature)
-            if feature_norm > 0:
-                feature = feature / feature_norm
-            else:
-                feature = np.zeros_like(feature)
-
-            if len(feature) < 64:
-                feature = np.pad(feature, (0, 64 - len(feature)))
-            elif len(feature) > 64:
-                feature = feature[:64]
-
-        except Exception as e:
-            feature = np.zeros(64, dtype=np.float32)
-
-        return feature.astype(np.float32)
 
 
 class FaceClothingDetector:
