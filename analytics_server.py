@@ -689,8 +689,8 @@ class VideoAnalyticsServer:
 
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.9,
-            max_age=5,  # Уменьшили до 5 кадров для быстрого удаления
+            max_iou_distance=0.8,
+            max_age=10,  # Уменьшили до 10 кадров для быстрого удаления
             n_init=2  # Уменьшили до 2 кадров для быстрого подтверждения
         )
         print("Tracker initialized with Euclidean distance, threshold=0.15")
@@ -872,19 +872,31 @@ class VideoAnalyticsServer:
             if track_id in self.active_visitors:
                 self.active_visitors[track_id]['last_seen'] = datetime.utcnow()
 
+        # Временно отсутствующие (еще не удаленные)
+        temporarily_absent = previous_ids - current_ids
+        if temporarily_absent:
+            print(f"  ⏸️ TEMPORARILY ABSENT (still in timeout): {list(temporarily_absent)}")
+
         # Удаляем неактивных (тех, кого нет в текущих confirmed треках)
-        inactive_timeout = timedelta(seconds=10)  # 10 секунд бездействия
+        inactive_timeout = timedelta(seconds=1)  # Всего 1 секунды ожидания!
         now = datetime.utcnow()
         inactive_visitors = []
 
         for track_id, data in self.active_visitors.items():
             if track_id not in current_ids:
-                if now - data['last_seen'] > inactive_timeout:
+                time_since_last_seen = now - data['last_seen']
+                if time_since_last_seen > inactive_timeout:
                     inactive_visitors.append(track_id)
+                    print(
+                        f"  ⏳ Track {track_id} inactive for {time_since_last_seen.total_seconds():.1f}s > {inactive_timeout.total_seconds()}s")
 
         for track_id in inactive_visitors:
             del self.active_visitors[track_id]
             print(f"  🗑️ REMOVED FROM ACTIVE VISITORS (inactive): track_id={track_id}")
+
+        # Логируем текущее состояние
+        print(
+            f"  📊 Active visitors after update: {len(self.active_visitors)} (IDs: {list(self.active_visitors.keys())})")
 
     def generate_report(self, report_type, start_date, end_date):
         """Генерация отчетов"""
