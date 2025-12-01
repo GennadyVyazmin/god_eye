@@ -215,11 +215,15 @@ class NearestNeighborDistanceMetric:
                 if target in self.samples and len(self.samples[target]) > 0:
                     # Берем последнюю фичу трека
                     target_feature = self.samples[target][-1]
-                    dist = self._metric(feature, target_feature)
-                    cost_matrix[i, j] = dist
-                    # ДЕБАГ: логируем расстояния
-                    if dist < 0.3:  # Только близкие расстояния
-                        print(f"      Distance Detection {i} -> Track {target}: {dist:.3f}")
+
+                    # ВРЕМЕННО: всегда возвращаем маленькое расстояние для теста
+                    cost_matrix[i, j] = 0.1  # Фиксированное маленькое расстояние
+
+                    # Для отладки: вычисляем реальное расстояние
+                    real_dist = self._metric(feature, target_feature)
+                    print(f"      REAL Distance Detection {i} -> Track {target}: {real_dist:.6f}")
+                    print(f"      Feature {i}: norm={np.linalg.norm(feature):.6f}")
+                    print(f"      Target {target}: norm={np.linalg.norm(target_feature):.6f}")
                 else:
                     cost_matrix[i, j] = 1.0  # Максимальная дистанция
 
