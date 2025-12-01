@@ -39,13 +39,13 @@ class VideoAnalyticsServer:
         self.detector = FaceClothingDetector(use_yolo=True)
 
         print("Initializing DeepSORT tracker...")
-        # Оптимальные параметры для стабильного трекинга
-        self.metric = NearestNeighborDistanceMetric("cosine", 0.3)  # Средний порог
+        # Более мягкие параметры для лучшего сопоставления
+        self.metric = NearestNeighborDistanceMetric("cosine", 0.5)  # УВЕЛИЧИЛИ порог до 0.5
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.7,  # Средний порог для лучшего сопоставления
+            max_iou_distance=0.7,  # Средний порог
             max_age=30,  # Для стабильного трекинга
-            n_init=5  # Более требовательное подтверждение трека
+            n_init=3  # УМЕНЬШИЛИ для быстрого подтверждения
         )
 
         # Видео поток
@@ -115,7 +115,7 @@ class VideoAnalyticsServer:
         @self.socketio.on('disconnect')
         def handle_disconnect():
             self.clients_connected = max(0, self.clients_connected - 1)
-            print(f'Client disconnected. Total clients: {self.clients_connected}')  # ИСПРАВЛЕНО: закрыта кавычка
+            print(f'Client disconnected. Total clients: {self.clients_connected}')
 
         @self.socketio.on('start_stream')
         def handle_start_stream():
@@ -698,6 +698,11 @@ class VideoAnalyticsServer:
                 f"Detections: {total_detections} (faces: {len(face_detections)}, clothing: {len(clothing_detections)})")
             print(f"Active visitors before: {len(self.active_visitors)}")
             print(f"Total tracks before: {len(self.tracker.tracks)}")
+
+            # Выводим состояние каждого трека
+            for i, track in enumerate(self.tracker.tracks):
+                print(
+                    f"  Existing Track {track.track_id} ({track.state}): hits={track.hits}, age={track.age}, time_since_update={track.time_since_update}")
 
             # Объединяем все детекции
             all_detections = face_detections + clothing_detections
