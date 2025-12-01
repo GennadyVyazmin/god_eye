@@ -214,6 +214,8 @@ class VideoAnalyticsServer:
         print("WebSocket stream thread stopped")
         self.websocket_active = False
 
+    # ... (setup_routes метод остается без изменений, как в предыдущем коде)
+    # Полный HTML код слишком длинный, оставляю его как есть
     def setup_routes(self):
         """Настройка API маршрутов"""
 
@@ -682,14 +684,13 @@ class VideoAnalyticsServer:
         print("Initializing DeepSORT tracker...")
 
         # Используем евклидово расстояние с увеличенным порогом
-        # Для 4-мерных векторов со значениями [0, 0.5], макс расстояние = 1.0
         self.metric = NearestNeighborDistanceMetric("euclidean", 0.3, budget=50)
 
         self.tracker = Tracker(
             self.metric,
-            max_iou_distance=0.9,  # Большой порог IoU для лучшего сопоставления
-            max_age=30,  # 30 кадров без обновлений
-            n_init=3  # 3 кадра для подтверждения
+            max_iou_distance=0.9,
+            max_age=30,
+            n_init=3
         )
         print("Tracker initialized with Euclidean distance, threshold=0.3")
 
@@ -706,7 +707,6 @@ class VideoAnalyticsServer:
             # Логируем общее количество детекций
             total_detections = len(face_detections) + len(clothing_detections)
 
-            # Дебаг информация
             print(f"\n=== Frame {self.frames_processed} ===")
             print(
                 f"Detections: {total_detections} (faces: {len(face_detections)}, clothing: {len(clothing_detections)})")
