@@ -215,19 +215,44 @@ class NearestNeighborDistanceMetric:
                 if target in self.samples and len(self.samples[target]) > 0:
                     # Берем последнюю фичу трека
                     target_feature = self.samples[target][-1]
-
-                    # ВРЕМЕННО: всегда возвращаем маленькое расстояние для теста
-                    cost_matrix[i, j] = 0.1  # Фиксированное маленькое расстояние
-
-                    # Для отладки: вычисляем реальное расстояние
-                    real_dist = self._metric(feature, target_feature)
-                    print(f"      REAL Distance Detection {i} -> Track {target}: {real_dist:.6f}")
-                    print(f"      Feature {i}: norm={np.linalg.norm(feature):.6f}")
-                    print(f"      Target {target}: norm={np.linalg.norm(target_feature):.6f}")
+                    dist = self._metric(feature, target_feature)
+                    cost_matrix[i, j] = dist
+                    # ДЕБАГ: логируем расстояния
+                    if dist < 0.3:  # Только близкие расстояния
+                        print(f"      Distance Detection {i} -> Track {target}: {dist:.3f}")
                 else:
                     cost_matrix[i, j] = 1.0  # Максимальная дистанция
 
         return cost_matrix
+
+    def _extract_ultra_simple_feature(self, image, bbox):
+        """
+        САМЫЕ ПРОСТЫЕ фичи - только координаты центра
+        """
+        x, y, w, h = [int(coord) for coord in bbox]
+
+        h_img, w_img = image.shape[:2]
+        x = max(0, min(x, w_img - 1))
+        y = max(0, min(y, h_img - 1))
+        w = max(10, min(w, w_img - x))
+        h = max(20, min(h, h_img - y))
+
+        # ТОЛЬКО координаты центра
+        center_x = (x + w / 2) / w_img
+        center_y = (y + h / 2) / h_img
+
+        feature = np.array([center_x, center_y], dtype=np.float32)
+
+        # Нормализуем
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm > 0:
+            feature = feature / feature_norm
+        else:
+            feature = np.array([1.0, 0.0], dtype=np.float32)
+
+        print(f"    Ultra simple feature: center=({center_x:.3f}, {center_y:.3f}), norm={np.linalg.norm(feature):.6f}")
+
+        return feature
 
 
 class Tracker:
