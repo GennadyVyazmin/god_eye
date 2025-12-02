@@ -25,85 +25,55 @@ app.config['SECRET_KEY'] = 'video-analytics-secret'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 api = Api(app)
 
+# Глобальные переменные которые будут заполнены при запуске
+server = None
+server_start_time = None
+
 
 class VideoAnalyticsServer:
-    import cv2
-    import numpy as np
-    import torch
-    from datetime import datetime, timedelta
-    import json
-    import base64
-    from flask import Flask, request, jsonify, Response
-    from flask_restful import Api, Resource
-    from flask_socketio import SocketIO, emit
-    import threading
-    import time
-    import os
+    def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
+        self.app = app
+        self.socketio = socketio
+        self.api = api
+        self.rtsp_url = rtsp_url
+        self.backend_name = "Unknown"
 
-    # Настройки для OpenCV
-    os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
-    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+        # Инициализация детектора
+        print("Initializing FaceClothingDetector...")
+        self.detector = FaceClothingDetector(use_yolo=True)
 
-    from models import db, Visitor, Detection, Appearance, Report, VisitorPhoto
-    from yolo_detector import FaceClothingDetector
-    from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
-    from long_term_tracker import LongTermTracker  # Новый импорт
+        # Инициализация трекера будет выполнена позже
+        self.tracker = None
+        self.metric = None
 
-    # Создаем Flask app и SocketIO
-    app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'video-analytics-secret'
-    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-    api = Api(app)
+        # Видео поток
+        self.cap = None
+        self.frame = None
+        self.processing = False
+        self.stream_thread = None
+        self.process_thread = None
+        self.websocket_thread = None
+        self.websocket_active = False
+        self.frame_lock = threading.Lock()
+        self.stream_info = {}
 
-    class VideoAnalyticsServer:
-        def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
-            self.app = app
-            self.socketio = socketio
-            self.api = api
-            self.rtsp_url = rtsp_url
-            self.backend_name = "Unknown"
+        # Статистика
+        self.active_visitors = {}  # Только CONFIRMED треки
+        self.visitor_counter = 0
+        self.last_processed = None
+        self.frames_processed = 0
+        self.frames_read = 0
+        self.clients_connected = 0
 
-            # Инициализация детектора
-            print("Initializing FaceClothingDetector...")
-            self.detector = FaceClothingDetector(use_yolo=True)
+        # Тестовый кадр если RTSP не работает
+        self.test_frame = self._create_test_frame()
 
-            # Инициализация трекеров
-            self.tracker = None
-            self.metric = None
-            self.long_term_tracker = LongTermTracker(
-                feature_dim=4,
-                similarity_threshold=0.93,  # 93% похожести
-                memory_hours=20
-            )
+        self.setup_database()
+        self.setup_routes()
+        self.setup_socketio_events()
 
-            # Видео поток
-            self.cap = None
-            self.frame = None
-            self.processing = False
-            self.stream_thread = None
-            self.process_thread = None
-            self.websocket_thread = None
-            self.websocket_active = False
-            self.frame_lock = threading.Lock()
-            self.stream_info = {}
-
-            # Статистика
-            self.active_visitors = {}  # Активные в кадре
-            self.visitor_counter = 0
-            self.last_processed = None
-            self.frames_processed = 0
-            self.frames_read = 0
-            self.clients_connected = 0
-
-            # Тестовый кадр если RTSP не работает
-            self.test_frame = self._create_test_frame()
-
-            self.setup_database()
-            self.setup_routes()
-            self.setup_socketio_events()
-
-            print("Video Analytics Server initialized with 20-hour memory")
-            print(f"RTSP URL: {rtsp_url}")
+        print("Video Analytics Server initialized successfully")
+        print(f"RTSP URL: {rtsp_url}")
 
     def _create_test_frame(self):
         """Создание тестового кадра если RTSP не работает"""
@@ -248,8 +218,6 @@ class VideoAnalyticsServer:
         print("WebSocket stream thread stopped")
         self.websocket_active = False
 
-    # ... (setup_routes метод остается без изменений, как в предыдущем коде)
-    # Полный HTML код слишком длинный, оставляю его как есть
     def setup_routes(self):
         """Настройка API маршрутов"""
 
@@ -312,7 +280,7 @@ class VideoAnalyticsServer:
                         <p><strong>Бэкенд:</strong> <span id="backend">Unknown</span></p>
                         <p><strong>Разрешение:</strong> <span id="resolution">N/A</span></p>
                         <p><strong>FPS:</strong> <span id="fps">N/A</span></p>
-                        <p><strong>RTSP URL:</strong> <code>rtsp://admin:admin@10.0.0.242:554/live/main</code></p>
+                        <p><strong>RTSP URL:</strong> <code id="rtspUrl">rtsp://admin:admin@10.0.0.242:554/live/main</code></p>
                     </div>
 
                     <div class="video-container">
@@ -455,6 +423,7 @@ class VideoAnalyticsServer:
                         document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
                         document.getElementById('frames').textContent = data.frames_processed || 0;
                         document.getElementById('backend').textContent = data.backend || 'Unknown';
+                        document.getElementById('rtspUrl').textContent = data.rtsp_url || 'N/A';
 
                         if(data.stream_info) {
                             document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
@@ -957,7 +926,7 @@ class VideoAnalyticsServer:
             return report.id
 
     def run(self, host='0.0.0.0', port=5000):
-        """Запуск сервера"""
+        """Запуск сервера (для прямого запуска)"""
         print("Attempting to start RTSP stream...")
         if not self.start_video_stream():
             print("Warning: Could not start RTSP stream. Server will run with test frame.")
@@ -1056,15 +1025,15 @@ class Statistics(Resource):
                     'total_visitors': total_visitors,
                     'active_visitors': active_visitors,
                     'today_visitors': today_visitors,
-                    'currently_tracking': len(server.active_visitors),
-                    'processing_status': server.processing,
-                    'rtsp_stream': server.rtsp_url,
-                    'server_uptime': str(datetime.now() - server_start_time),
-                    'stream_info': server.get_stream_info(),
-                    'frames_processed': server.frames_processed,
-                    'frames_read': server.frames_read,
-                    'websocket_active': server.websocket_active,
-                    'clients_connected': server.clients_connected,
+                    'currently_tracking': len(server.active_visitors) if server else 0,
+                    'processing_status': server.processing if server else False,
+                    'rtsp_stream': server.rtsp_url if server else 'Not initialized',
+                    'server_uptime': str(datetime.now() - server_start_time) if server_start_time else '0',
+                    'stream_info': server.get_stream_info() if server else {},
+                    'frames_processed': server.frames_processed if server else 0,
+                    'frames_read': server.frames_read if server else 0,
+                    'websocket_active': server.websocket_active if server else False,
+                    'clients_connected': server.clients_connected if server else 0,
                     'total_tracks': total_tracks
                 }, 200
 
@@ -1072,9 +1041,8 @@ class Statistics(Resource):
             return {'error': str(e)}, 500
 
 
-# Глобальный экземпляр сервера
-server = VideoAnalyticsServer()
-server_start_time = datetime.now()
-
 if __name__ == '__main__':
+    # Запуск напрямую (для тестирования)
+    server = VideoAnalyticsServer()
+    server_start_time = datetime.now()
     server.run()
