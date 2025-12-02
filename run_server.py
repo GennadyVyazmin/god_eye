@@ -6,7 +6,6 @@
 import argparse
 import sys
 import os
-from datetime import datetime
 
 
 def main():
@@ -25,16 +24,8 @@ def main():
     else:
         print("Warning: No GPU detected. Using CPU mode.")
 
-    # Импортируем необходимые модули
-    from analytics_server import app, socketio, VideoAnalyticsServer
-    import analytics_server
-
-    # Создаем сервер с переданным RTSP URL
-    server = VideoAnalyticsServer(rtsp_url=args.rtsp)
-
-    # Сохраняем ссылку на сервер в модуле analytics_server для API
-    analytics_server.server = server
-    analytics_server.server_start_time = datetime.now()
+    # Запуск сервера
+    from analytics_server import server
 
     print(f"Server starting on http://{args.host}:{args.port}")
     print(f"RTSP stream: {args.rtsp}")
@@ -45,13 +36,7 @@ def main():
     print("  GET /api/visitors - List visitors")
     print("  GET /api/statistics - Statistics")
 
-    # Запускаем RTSP поток
-    print("Attempting to start RTSP stream...")
-    if not server.start_video_stream():
-        print("Warning: Could not start RTSP stream. Server will run with test frame.")
-
-    # Запускаем SocketIO сервер
-    socketio.run(app, host=args.host, port=args.port, debug=False, allow_unsafe_werkzeug=True)
+    server.run(host=args.host, port=args.port)
 
 
 if __name__ == '__main__':
