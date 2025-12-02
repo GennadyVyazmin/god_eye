@@ -414,18 +414,21 @@ class VideoAnalyticsServer:
                         } else {
                             statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
                         }
-
+                    
                         document.getElementById('visitors').textContent = data.active_visitors;
-                        document.getElementById('total').textContent = data.total_visitors;
+                        document.getElementById('total').textContent = data.total_visitors;  // Из БД
                         document.getElementById('totalTracks').textContent = data.total_tracks || 0;
                         document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
                         document.getElementById('frames').textContent = data.frames_processed || 0;
                         document.getElementById('backend').textContent = data.backend || 'Unknown';
-
+                    
                         if(data.stream_info) {
                             document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
                             document.getElementById('fps').textContent = data.stream_info.fps || 'N/A';
                         }
+                        
+                        // Для отладки
+                        console.log('Status data:', data);
                     }
 
                     function addLog(message) {
@@ -468,9 +471,15 @@ class VideoAnalyticsServer:
 
         # API маршруты
         @self.app.route('/api/status')
+        @app.route('/api/status')
         def api_status():
             total_tracks = len(self.tracker.tracks) if self.tracker else 0
             confirmed_tracks = len([t for t in self.tracker.tracks if t.is_confirmed()]) if self.tracker else 0
+
+            # Получаем актуальные данные из БД
+            with self.app.app_context():
+                total_visitors_in_db = Visitor.query.count()
+                active_visitors_in_db = Visitor.query.filter_by(is_active=True).count()
 
             return jsonify({
                 'status': 'running',
@@ -478,7 +487,8 @@ class VideoAnalyticsServer:
                 'rtsp_url': self.rtsp_url,
                 'processing': self.processing,
                 'active_visitors': len(self.active_visitors),  # Только confirmed
-                'total_visitors': self.visitor_counter,
+                'total_visitors': total_visitors_in_db,  # Из БД
+                'active_visitors_db': active_visitors_in_db,  # Активные из БД
                 'total_tracks': total_tracks,
                 'confirmed_tracks': confirmed_tracks,
                 'last_processed': self.last_processed.isoformat() if self.last_processed else None,
@@ -488,7 +498,8 @@ class VideoAnalyticsServer:
                 'clients_connected': self.clients_connected,
                 'websocket_active': self.websocket_active,
                 'stream_info': self.stream_info,
-                'backend': self.backend_name
+                'backend': self.backend_name,
+                'visitor_counter_memory': self.visitor_counter  # Для отладки
             })
 
         @self.app.route('/api/snapshot')
@@ -832,16 +843,30 @@ class VideoAnalyticsServer:
                 now = datetime.utcnow()
 
                 if not visitor:
-                    visitor = Visitor(track_id=track_id, first_seen=now, last_seen=now)
+                    # Создаем нового посетителя
+                    visitor = Visitor(
+                        track_id=track_id,
+                        first_seen=now,
+                        last_seen=now,
+                        visit_count=1,
+                        is_active=True  # Явно устанавливаем активность
+                    )
                     db.session.add(visitor)
                     db.session.commit()
                     self.visitor_counter += 1
-                    print(f"New visitor created in DB: track_id={track_id}")
-
-                db.session.commit()
+                    print(f"New visitor created in DB: track_id={track_id}, total_visitors={self.visitor_counter}")
+                else:
+                    # Обновляем существующего
+                    visitor.last_seen = now
+                    visitor.visit_count = Visitor.visit_count + 1  # Инкрементируем счетчик
+                    visitor.is_active = True  # Устанавливаем активность
+                    db.session.commit()
+                    print(f"Updated visitor in DB: track_id={track_id}, visit_count={visitor.visit_count}")
 
         except Exception as e:
             print(f"Error updating visitor in DB: {e}")
+            import traceback
+            traceback.print_exc()
 
     def update_active_visitors(self, current_tracks):
         """
@@ -872,13 +897,8 @@ class VideoAnalyticsServer:
             if track_id in self.active_visitors:
                 self.active_visitors[track_id]['last_seen'] = datetime.utcnow()
 
-        # Временно отсутствующие (еще не удаленные)
-        temporarily_absent = previous_ids - current_ids
-        if temporarily_absent:
-            print(f"  ⏸️ TEMPORARILY ABSENT (still in timeout): {list(temporarily_absent)}")
-
-        # Удаляем неактивных (тех, кого нет в текущих confirmed треках)
-        inactive_timeout = timedelta(seconds=1)  # Всего 1 секунды ожидания!
+        # Удаляем неактивных
+        inactive_timeout = timedelta(seconds=3)  # 3 секунды ожидания
         now = datetime.utcnow()
         inactive_visitors = []
 
@@ -887,40 +907,33 @@ class VideoAnalyticsServer:
                 time_since_last_seen = now - data['last_seen']
                 if time_since_last_seen > inactive_timeout:
                     inactive_visitors.append(track_id)
-                    print(
-                        f"  ⏳ Track {track_id} inactive for {time_since_last_seen.total_seconds():.1f}s > {inactive_timeout.total_seconds()}s")
+                    print(f"  ⏳ Track {track_id} inactive for {time_since_last_seen.total_seconds():.1f}s")
+
+        # Обновляем БД для неактивных посетителей
+        if inactive_visitors:
+            with self.app.app_context():
+                for track_id in inactive_visitors:
+                    visitor = Visitor.query.filter_by(track_id=track_id).first()
+                    if visitor:
+                        visitor.is_active = False
+                        print(f"  🗑️ Set visitor {track_id} as inactive in DB")
+                db.session.commit()
 
         for track_id in inactive_visitors:
             del self.active_visitors[track_id]
             print(f"  🗑️ REMOVED FROM ACTIVE VISITORS (inactive): track_id={track_id}")
 
-        # Логируем текущее состояние
-        print(
-            f"  📊 Active visitors after update: {len(self.active_visitors)} (IDs: {list(self.active_visitors.keys())})")
-
-    def generate_report(self, report_type, start_date, end_date):
-        """Генерация отчетов"""
+        # Обновляем БД для активных посетителей
         with self.app.app_context():
-            if report_type == 'daily_visitors':
-                visitors = Visitor.query.filter(
-                    Visitor.first_seen >= start_date,
-                    Visitor.first_seen <= end_date
-                ).all()
-
-                data = {
-                    'total_visitors': len(visitors),
-                    'unique_visitors': len(set([v.track_id for v in visitors])),
-                    'visit_times': [v.first_seen.isoformat() for v in visitors]
-                }
-
-            report = Report(
-                report_type=report_type,
-                data=json.dumps(data)
-            )
-            db.session.add(report)
+            for track_id in current_ids:
+                visitor = Visitor.query.filter_by(track_id=track_id).first()
+                if visitor and not visitor.is_active:
+                    visitor.is_active = True
+                    print(f"  ✅ Reactivated visitor {track_id} in DB")
             db.session.commit()
 
-            return report.id
+        print(
+            f"  📊 Active visitors after update: {len(self.active_visitors)} (IDs: {list(self.active_visitors.keys())})")
 
     def run(self, host='0.0.0.0', port=5000):
         """Запуск сервера"""
