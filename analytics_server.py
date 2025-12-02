@@ -27,83 +27,49 @@ api = Api(app)
 
 
 class VideoAnalyticsServer:
-    import cv2
-    import numpy as np
-    import torch
-    from datetime import datetime, timedelta
-    import json
-    import base64
-    from flask import Flask, request, jsonify, Response
-    from flask_restful import Api, Resource
-    from flask_socketio import SocketIO, emit
-    import threading
-    import time
-    import os
+    def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
+        self.app = app
+        self.socketio = socketio
+        self.api = api
+        self.rtsp_url = rtsp_url
+        self.backend_name = "Unknown"
 
-    # Настройки для OpenCV
-    os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
-    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+        # Инициализация детектора
+        print("Initializing FaceClothingDetector...")
+        self.detector = FaceClothingDetector(use_yolo=True)
 
-    from models import db, Visitor, Detection, Appearance, Report, VisitorPhoto
-    from yolo_detector import FaceClothingDetector
-    from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
-    from long_term_tracker import LongTermTracker  # Новый импорт
+        # Инициализация трекера будет выполнена позже
+        self.tracker = None
+        self.metric = None
 
-    # Создаем Flask app и SocketIO
-    app = Flask(__name__)
-    app.config['SECRET_KEY'] = 'video-analytics-secret'
-    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-    api = Api(app)
+        # Видео поток
+        self.cap = None
+        self.frame = None
+        self.processing = False
+        self.stream_thread = None
+        self.process_thread = None
+        self.websocket_thread = None
+        self.websocket_active = False
+        self.frame_lock = threading.Lock()
+        self.stream_info = {}
 
-    class VideoAnalyticsServer:
-        def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
-            self.app = app
-            self.socketio = socketio
-            self.api = api
-            self.rtsp_url = rtsp_url
-            self.backend_name = "Unknown"
+        # Статистика
+        self.active_visitors = {}  # Только CONFIRMED треки
+        self.visitor_counter = 0
+        self.last_processed = None
+        self.frames_processed = 0
+        self.frames_read = 0
+        self.clients_connected = 0
 
-            # Инициализация детектора
-            print("Initializing FaceClothingDetector...")
-            self.detector = FaceClothingDetector(use_yolo=True)
+        # Тестовый кадр если RTSP не работает
+        self.test_frame = self._create_test_frame()
 
-            # Инициализация трекеров
-            self.tracker = None
-            self.metric = None
-            self.long_term_tracker = LongTermTracker(
-                feature_dim=4,
-                similarity_threshold=0.93,  # 93% похожести
-                memory_hours=20
-            )
+        self.setup_database()
+        self.setup_routes()
+        self.setup_socketio_events()
 
-            # Видео поток
-            self.cap = None
-            self.frame = None
-            self.processing = False
-            self.stream_thread = None
-            self.process_thread = None
-            self.websocket_thread = None
-            self.websocket_active = False
-            self.frame_lock = threading.Lock()
-            self.stream_info = {}
-
-            # Статистика
-            self.active_visitors = {}  # Активные в кадре
-            self.visitor_counter = 0
-            self.last_processed = None
-            self.frames_processed = 0
-            self.frames_read = 0
-            self.clients_connected = 0
-
-            # Тестовый кадр если RTSP не работает
-            self.test_frame = self._create_test_frame()
-
-            self.setup_database()
-            self.setup_routes()
-            self.setup_socketio_events()
-
-            print("Video Analytics Server initialized with 20-hour memory")
-            print(f"RTSP URL: {rtsp_url}")
+        print("Video Analytics Server initialized successfully")
+        print(f"RTSP URL: {rtsp_url}")
 
     def _create_test_frame(self):
         """Создание тестового кадра если RTSP не работает"""
