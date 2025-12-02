@@ -27,49 +27,83 @@ api = Api(app)
 
 
 class VideoAnalyticsServer:
-    def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
-        self.app = app
-        self.socketio = socketio
-        self.api = api
-        self.rtsp_url = rtsp_url
-        self.backend_name = "Unknown"
+    import cv2
+    import numpy as np
+    import torch
+    from datetime import datetime, timedelta
+    import json
+    import base64
+    from flask import Flask, request, jsonify, Response
+    from flask_restful import Api, Resource
+    from flask_socketio import SocketIO, emit
+    import threading
+    import time
+    import os
 
-        # Инициализация детектора
-        print("Initializing FaceClothingDetector...")
-        self.detector = FaceClothingDetector(use_yolo=True)
+    # Настройки для OpenCV
+    os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
+    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
 
-        # Инициализация трекера будет выполнена позже
-        self.tracker = None
-        self.metric = None
+    from models import db, Visitor, Detection, Appearance, Report, VisitorPhoto
+    from yolo_detector import FaceClothingDetector
+    from deep_sort import Tracker, NearestNeighborDistanceMetric, Detection as DeepSortDetection
+    from long_term_tracker import LongTermTracker  # Новый импорт
 
-        # Видео поток
-        self.cap = None
-        self.frame = None
-        self.processing = False
-        self.stream_thread = None
-        self.process_thread = None
-        self.websocket_thread = None
-        self.websocket_active = False
-        self.frame_lock = threading.Lock()
-        self.stream_info = {}
+    # Создаем Flask app и SocketIO
+    app = Flask(__name__)
+    app.config['SECRET_KEY'] = 'video-analytics-secret'
+    socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+    api = Api(app)
 
-        # Статистика
-        self.active_visitors = {}  # Только CONFIRMED треки
-        self.visitor_counter = 0
-        self.last_processed = None
-        self.frames_processed = 0
-        self.frames_read = 0
-        self.clients_connected = 0
+    class VideoAnalyticsServer:
+        def __init__(self, rtsp_url='rtsp://admin:admin@10.0.0.242:554/live/main'):
+            self.app = app
+            self.socketio = socketio
+            self.api = api
+            self.rtsp_url = rtsp_url
+            self.backend_name = "Unknown"
 
-        # Тестовый кадр если RTSP не работает
-        self.test_frame = self._create_test_frame()
+            # Инициализация детектора
+            print("Initializing FaceClothingDetector...")
+            self.detector = FaceClothingDetector(use_yolo=True)
 
-        self.setup_database()
-        self.setup_routes()
-        self.setup_socketio_events()
+            # Инициализация трекеров
+            self.tracker = None
+            self.metric = None
+            self.long_term_tracker = LongTermTracker(
+                feature_dim=4,
+                similarity_threshold=0.93,  # 93% похожести
+                memory_hours=20
+            )
 
-        print("Video Analytics Server initialized successfully")
-        print(f"RTSP URL: {rtsp_url}")
+            # Видео поток
+            self.cap = None
+            self.frame = None
+            self.processing = False
+            self.stream_thread = None
+            self.process_thread = None
+            self.websocket_thread = None
+            self.websocket_active = False
+            self.frame_lock = threading.Lock()
+            self.stream_info = {}
+
+            # Статистика
+            self.active_visitors = {}  # Активные в кадре
+            self.visitor_counter = 0
+            self.last_processed = None
+            self.frames_processed = 0
+            self.frames_read = 0
+            self.clients_connected = 0
+
+            # Тестовый кадр если RTSP не работает
+            self.test_frame = self._create_test_frame()
+
+            self.setup_database()
+            self.setup_routes()
+            self.setup_socketio_events()
+
+            print("Video Analytics Server initialized with 20-hour memory")
+            print(f"RTSP URL: {rtsp_url}")
 
     def _create_test_frame(self):
         """Создание тестового кадра если RTSP не работает"""
@@ -414,21 +448,18 @@ class VideoAnalyticsServer:
                         } else {
                             statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
                         }
-                    
+
                         document.getElementById('visitors').textContent = data.active_visitors;
-                        document.getElementById('total').textContent = data.total_visitors;  // Из БД
+                        document.getElementById('total').textContent = data.total_visitors;
                         document.getElementById('totalTracks').textContent = data.total_tracks || 0;
                         document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
                         document.getElementById('frames').textContent = data.frames_processed || 0;
                         document.getElementById('backend').textContent = data.backend || 'Unknown';
-                    
+
                         if(data.stream_info) {
                             document.getElementById('resolution').textContent = data.stream_info.resolution || 'N/A';
                             document.getElementById('fps').textContent = data.stream_info.fps || 'N/A';
                         }
-                        
-                        // Для отладки
-                        console.log('Status data:', data);
                     }
 
                     function addLog(message) {
@@ -471,15 +502,9 @@ class VideoAnalyticsServer:
 
         # API маршруты
         @self.app.route('/api/status')
-        @app.route('/api/status')
         def api_status():
             total_tracks = len(self.tracker.tracks) if self.tracker else 0
             confirmed_tracks = len([t for t in self.tracker.tracks if t.is_confirmed()]) if self.tracker else 0
-
-            # Получаем актуальные данные из БД
-            with self.app.app_context():
-                total_visitors_in_db = Visitor.query.count()
-                active_visitors_in_db = Visitor.query.filter_by(is_active=True).count()
 
             return jsonify({
                 'status': 'running',
@@ -487,8 +512,7 @@ class VideoAnalyticsServer:
                 'rtsp_url': self.rtsp_url,
                 'processing': self.processing,
                 'active_visitors': len(self.active_visitors),  # Только confirmed
-                'total_visitors': total_visitors_in_db,  # Из БД
-                'active_visitors_db': active_visitors_in_db,  # Активные из БД
+                'total_visitors': self.visitor_counter,
                 'total_tracks': total_tracks,
                 'confirmed_tracks': confirmed_tracks,
                 'last_processed': self.last_processed.isoformat() if self.last_processed else None,
@@ -498,8 +522,7 @@ class VideoAnalyticsServer:
                 'clients_connected': self.clients_connected,
                 'websocket_active': self.websocket_active,
                 'stream_info': self.stream_info,
-                'backend': self.backend_name,
-                'visitor_counter_memory': self.visitor_counter  # Для отладки
+                'backend': self.backend_name
             })
 
         @self.app.route('/api/snapshot')
@@ -843,30 +866,16 @@ class VideoAnalyticsServer:
                 now = datetime.utcnow()
 
                 if not visitor:
-                    # Создаем нового посетителя
-                    visitor = Visitor(
-                        track_id=track_id,
-                        first_seen=now,
-                        last_seen=now,
-                        visit_count=1,
-                        is_active=True  # Явно устанавливаем активность
-                    )
+                    visitor = Visitor(track_id=track_id, first_seen=now, last_seen=now)
                     db.session.add(visitor)
                     db.session.commit()
                     self.visitor_counter += 1
-                    print(f"New visitor created in DB: track_id={track_id}, total_visitors={self.visitor_counter}")
-                else:
-                    # Обновляем существующего
-                    visitor.last_seen = now
-                    visitor.visit_count = Visitor.visit_count + 1  # Инкрементируем счетчик
-                    visitor.is_active = True  # Устанавливаем активность
-                    db.session.commit()
-                    print(f"Updated visitor in DB: track_id={track_id}, visit_count={visitor.visit_count}")
+                    print(f"New visitor created in DB: track_id={track_id}")
+
+                db.session.commit()
 
         except Exception as e:
             print(f"Error updating visitor in DB: {e}")
-            import traceback
-            traceback.print_exc()
 
     def update_active_visitors(self, current_tracks):
         """
@@ -897,8 +906,13 @@ class VideoAnalyticsServer:
             if track_id in self.active_visitors:
                 self.active_visitors[track_id]['last_seen'] = datetime.utcnow()
 
-        # Удаляем неактивных
-        inactive_timeout = timedelta(seconds=3)  # 3 секунды ожидания
+        # Временно отсутствующие (еще не удаленные)
+        temporarily_absent = previous_ids - current_ids
+        if temporarily_absent:
+            print(f"  ⏸️ TEMPORARILY ABSENT (still in timeout): {list(temporarily_absent)}")
+
+        # Удаляем неактивных (тех, кого нет в текущих confirmed треках)
+        inactive_timeout = timedelta(seconds=1)  # Всего 1 секунды ожидания!
         now = datetime.utcnow()
         inactive_visitors = []
 
@@ -907,33 +921,40 @@ class VideoAnalyticsServer:
                 time_since_last_seen = now - data['last_seen']
                 if time_since_last_seen > inactive_timeout:
                     inactive_visitors.append(track_id)
-                    print(f"  ⏳ Track {track_id} inactive for {time_since_last_seen.total_seconds():.1f}s")
-
-        # Обновляем БД для неактивных посетителей
-        if inactive_visitors:
-            with self.app.app_context():
-                for track_id in inactive_visitors:
-                    visitor = Visitor.query.filter_by(track_id=track_id).first()
-                    if visitor:
-                        visitor.is_active = False
-                        print(f"  🗑️ Set visitor {track_id} as inactive in DB")
-                db.session.commit()
+                    print(
+                        f"  ⏳ Track {track_id} inactive for {time_since_last_seen.total_seconds():.1f}s > {inactive_timeout.total_seconds()}s")
 
         for track_id in inactive_visitors:
             del self.active_visitors[track_id]
             print(f"  🗑️ REMOVED FROM ACTIVE VISITORS (inactive): track_id={track_id}")
 
-        # Обновляем БД для активных посетителей
-        with self.app.app_context():
-            for track_id in current_ids:
-                visitor = Visitor.query.filter_by(track_id=track_id).first()
-                if visitor and not visitor.is_active:
-                    visitor.is_active = True
-                    print(f"  ✅ Reactivated visitor {track_id} in DB")
-            db.session.commit()
-
+        # Логируем текущее состояние
         print(
             f"  📊 Active visitors after update: {len(self.active_visitors)} (IDs: {list(self.active_visitors.keys())})")
+
+    def generate_report(self, report_type, start_date, end_date):
+        """Генерация отчетов"""
+        with self.app.app_context():
+            if report_type == 'daily_visitors':
+                visitors = Visitor.query.filter(
+                    Visitor.first_seen >= start_date,
+                    Visitor.first_seen <= end_date
+                ).all()
+
+                data = {
+                    'total_visitors': len(visitors),
+                    'unique_visitors': len(set([v.track_id for v in visitors])),
+                    'visit_times': [v.first_seen.isoformat() for v in visitors]
+                }
+
+            report = Report(
+                report_type=report_type,
+                data=json.dumps(data)
+            )
+            db.session.add(report)
+            db.session.commit()
+
+            return report.id
 
     def run(self, host='0.0.0.0', port=5000):
         """Запуск сервера"""
