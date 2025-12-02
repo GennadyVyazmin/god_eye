@@ -71,7 +71,7 @@ class YOLODetector:
 
                             # Фильтруем слишком маленькие детекции
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_simple_feature(image, bbox)
+                                feature = self._extract_improved_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -91,7 +91,7 @@ class YOLODetector:
                             bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
                             if bbox[2] > 50 and bbox[3] > 100:
-                                feature = self._extract_simple_feature(image, bbox)
+                                feature = self._extract_improved_feature(image, bbox)
                                 detections.append({
                                     'bbox': bbox,
                                     'confidence': float(conf),
@@ -105,10 +105,9 @@ class YOLODetector:
             print(f"Error in YOLO detection: {e}")
             return []
 
-    def _extract_simple_feature(self, image, bbox):
+    def _extract_improved_feature(self, image, bbox):
         """
-        ПРОСТЫЕ геометрические фичи БЕЗ избыточной нормализации
-        Только 4 основных параметра для стабильного трекинга
+        УЛУЧШЕННЫЕ фичи для лучшего трекинга (7 фич)
         """
         x, y, w, h = [int(coord) for coord in bbox]
 
@@ -119,26 +118,55 @@ class YOLODetector:
         w = max(10, min(w, w_img - x))
         h = max(20, min(h, h_img - y))
 
-        # Всего 4 фичи - центр и размер (относительные)
-        feature = np.array([
+        # 1. Базовые геометрические фичи (4 фичи)
+        geom_features = np.array([
             (x + w / 2) / w_img,  # центр X [0, 1]
             (y + h / 2) / h_img,  # центр Y [0, 1]
             w / w_img,  # ширина [0, 1]
             h / h_img  # высота [0, 1]
         ], dtype=np.float32)
 
-        # Масштабируем для уменьшения нормы
+        # 2. Простые цветовые фичи (3 фичи)
+        try:
+            crop = image[y:y + h, x:x + w]
+            if crop.size > 0 and h > 0 and w > 0:
+                # Ресайз к маленькому размеру для скорости
+                crop_small = cv2.resize(crop, (16, 32))
+
+                if len(crop_small.shape) == 3:  # Цветное изображение
+                    # Простые статистики по каналам
+                    mean_b = np.mean(crop_small[:, :, 0]) / 255.0  # Blue
+                    mean_g = np.mean(crop_small[:, :, 1]) / 255.0  # Green
+                    mean_r = np.mean(crop_small[:, :, 2]) / 255.0  # Red
+                    color_features = np.array([mean_b, mean_g, mean_r], dtype=np.float32)
+                else:
+                    # Grayscale
+                    mean_gray = np.mean(crop_small) / 255.0
+                    color_features = np.array([mean_gray, mean_gray, mean_gray], dtype=np.float32)
+            else:
+                color_features = np.zeros(3, dtype=np.float32)
+        except Exception as e:
+            # print(f"    Color feature error: {e}")
+            color_features = np.zeros(3, dtype=np.float32)
+
+        # 3. Объединяем все фичи (4 + 3 = 7 фич)
+        feature = np.concatenate([geom_features, color_features])
+
+        # 4. Масштабируем для уменьшения нормы
         feature = feature / 2.0  # Теперь значения [0, 0.5]
 
-        # Добавляем небольшую случайность для различимости фич
-        # Без этого одинаковые объекты могут иметь идентичные фичи
-        feature = feature + np.random.normal(0, 0.001, feature.shape)
+        # 5. Минимальный случайный шум для различимости
+        feature = feature + np.random.normal(0, 0.0005, feature.shape)
 
-        # Норма должна быть около 0.3-0.8, не 1.0!
+        # 6. Нормализуем (опционально, для стабильности)
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm > 0:
+            feature = feature / feature_norm * 0.5  # Норма ~0.5
+
         actual_norm = np.linalg.norm(feature)
 
-        print(f"    Simple feature: shape={feature.shape}, norm={actual_norm:.3f}, "
-              f"values={[f'{v:.3f}' for v in feature]}")
+        print(f"    Improved feature: shape={feature.shape}, norm={actual_norm:.3f}, "
+              f"center=({geom_features[0]:.3f},{geom_features[1]:.3f})")
 
         return feature.astype(np.float32)
 

@@ -229,24 +229,34 @@ class NearestNeighborDistanceMetric:
         for i, feature in enumerate(features):
             for j, target in enumerate(targets):
                 if target in self.samples and len(self.samples[target]) > 0:
-                    # Используем последнюю фичу трека
-                    track_feature = self.samples[target][-1]
-                    dist = self._metric(feature, track_feature)
+                    # Используем среднее значение нескольких последних фич для стабильности
+                    track_features = self.samples[target]
+                    num_features_to_use = min(3, len(track_features))  # Используем до 3 последних фич
+                    recent_features = track_features[-num_features_to_use:]
+
+                    # Вычисляем среднее расстояние до нескольких последних фич
+                    distances = []
+                    for track_feature in recent_features:
+                        dist = self._metric(feature, track_feature)
+                        distances.append(dist)
+
+                    # Используем минимальное расстояние (более лояльный подход)
+                    dist = min(distances)
                     cost_matrix[i, j] = dist
 
-                    print(f"      [Metric.distance] Detection {i} -> Track {target}: {dist:.3f} "
-                          f"(feature={feature[:2]}..., track_feature={track_feature[:2]}...)")
+                    print(f"      [Metric.distance] Detection {i} -> Track {target}: {dist:.4f} "
+                          f"(using {num_features_to_use} recent features)")
                 else:
                     # Новый трек или трек без фич
-                    cost_matrix[i, j] = self.matching_threshold / 2.0
+                    cost_matrix[i, j] = self.matching_threshold / 3.0  # Более низкое значение для новых треков
                     print(
-                        f"      [Metric.distance] Track {target} has no samples, using default: {self.matching_threshold / 2:.3f}")
+                        f"      [Metric.distance] Track {target} has no samples, using default: {self.matching_threshold / 3:.4f}")
 
         print(f"      [Metric.distance] Final cost matrix:")
         for i in range(cost_matrix.shape[0]):
             row_str = "        "
             for j in range(cost_matrix.shape[1]):
-                row_str += f"{cost_matrix[i, j]:.3f} "
+                row_str += f"{cost_matrix[i, j]:.4f} "
             print(row_str)
 
         return cost_matrix

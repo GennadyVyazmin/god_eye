@@ -61,6 +61,10 @@ class VideoAnalyticsServer:
         self.frames_read = 0
         self.clients_connected = 0
 
+        # История посетителей для лучшего трекинга
+        self.visitor_history = {}  # track_id -> {'first_seen': timestamp, 'features': []}
+        self.recent_tracks = {}  # track_id -> {'last_seen': timestamp, 'feature': feature, 'state': state}
+
         # Тестовый кадр если RTSP не работает
         self.test_frame = self._create_test_frame()
 
@@ -85,15 +89,6 @@ class VideoAnalyticsServer:
     def get_stream_info(self):
         return self.stream_info
 
-    # def setup_database(self):
-    #     """Настройка базы данных"""
-    #     self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///analytics.db'
-    #     self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    #     db.init_app(self.app)
-    #
-    #     with self.app.app_context():
-    #         db.create_all()
-
     def setup_database(self):
         """Настройка базы данных"""
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///analytics.db'
@@ -101,12 +96,13 @@ class VideoAnalyticsServer:
         db.init_app(self.app)
 
         with self.app.app_context():
-            # ДЛЯ ТЕСТИРОВАНИЯ - очищаем БД каждый раз
-            db.drop_all()
+            # Для тестирования можно очищать БД при каждом запуске
+            # db.drop_all()
             db.create_all()
 
-            self.visitor_counter = 0
-            print("✅ Database recreated. Visitor counter reset to 0.")
+            # Инициализируем счетчик посетителей
+            self.visitor_counter = Visitor.query.count()
+            print(f"📊 Database initialized. Total visitors in DB: {self.visitor_counter}")
 
     def setup_socketio_events(self):
         """Настройка WebSocket событий"""
@@ -187,11 +183,13 @@ class VideoAnalyticsServer:
                 cv2.putText(frame, f'Active Visitors: {len(self.active_visitors)}', (10, 80),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
-                # Проверяем наличие трекера
+                # Показываем историю треков
                 total_tracks = len(self.tracker.tracks) if self.tracker else 0
                 cv2.putText(frame, f'Total Tracks: {total_tracks}', (10, 120),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(frame, f'Frame: {frame_count}', (10, 160),
+                cv2.putText(frame, f'Unique Visitors: {self.visitor_counter}', (10, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, f'Frame: {frame_count}', (10, 200),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                 # Ресайзим для оптимизации
@@ -210,13 +208,15 @@ class VideoAnalyticsServer:
                         'frame_count': frame_count,
                         'timestamp': datetime.now().isoformat(),
                         'status': status_text,
-                        'active_visitors': len(self.active_visitors)
+                        'active_visitors': len(self.active_visitors),
+                        'total_visitors': self.visitor_counter
                     })
                     frame_count += 1
 
                     # Логируем каждые 30 кадров
                     if frame_count % 30 == 0:
-                        print(f"WebSocket: Sent {frame_count} frames, Active visitors: {len(self.active_visitors)}")
+                        print(
+                            f"WebSocket: Sent {frame_count} frames, Active visitors: {len(self.active_visitors)}, Total: {self.visitor_counter}")
 
                 # Пауза для снижения нагрузки (10 FPS)
                 time.sleep(0.1)
@@ -228,8 +228,6 @@ class VideoAnalyticsServer:
         print("WebSocket stream thread stopped")
         self.websocket_active = False
 
-    # ... (setup_routes метод остается без изменений, как в предыдущем коде)
-    # Полный HTML код слишком длинный, оставляю его как есть
     def setup_routes(self):
         """Настройка API маршрутов"""
 
@@ -366,6 +364,11 @@ class VideoAnalyticsServer:
                             const currentActive = data.active_visitors;
                             document.getElementById('visitors').textContent = currentActive;
 
+                            // Обновляем общее количество посетителей
+                            if (data.total_visitors !== undefined) {
+                                document.getElementById('total').textContent = data.total_visitors;
+                            }
+
                             // Логируем изменения
                             if (currentActive !== lastActiveVisitors) {
                                 if (currentActive > lastActiveVisitors) {
@@ -378,7 +381,7 @@ class VideoAnalyticsServer:
                         }
 
                         document.getElementById('streamInfo').innerHTML = 
-                            `<p>Frames received: ${frameCount}, Active visitors: ${data.active_visitors || 0}, Last update: ${new Date().toLocaleTimeString()}</p>`;
+                            `<p>Frames received: ${frameCount}, Active visitors: ${data.active_visitors || 0}, Total: ${data.total_visitors || 0}, Last update: ${new Date().toLocaleTimeString()}</p>`;
                     });
 
                     // Функции управления
@@ -429,8 +432,8 @@ class VideoAnalyticsServer:
                             statusElement.innerHTML = '<span class="status-off">⚫ NO SIGNAL</span>';
                         }
 
-                        document.getElementById('visitors').textContent = data.active_visitors;
-                        document.getElementById('total').textContent = data.total_visitors;
+                        document.getElementById('visitors').textContent = data.active_visitors || 0;
+                        document.getElementById('total').textContent = data.total_visitors || 0;
                         document.getElementById('totalTracks').textContent = data.total_tracks || 0;
                         document.getElementById('frame').textContent = data.frame_available ? 'Yes' : 'No';
                         document.getElementById('frames').textContent = data.frames_processed || 0;
@@ -461,9 +464,12 @@ class VideoAnalyticsServer:
                             .then(response => response.json())
                             .then(data => {
                                 updateStatusDisplay(data);
-                                // Обновляем счетчик треков
+                                // Обновляем счетчик треков и посетителей
                                 if (data.total_tracks !== undefined) {
                                     document.getElementById('totalTracks').textContent = data.total_tracks;
+                                }
+                                if (data.total_visitors !== undefined) {
+                                    document.getElementById('total').textContent = data.total_visitors;
                                 }
                             })
                             .catch(error => console.error('Error fetching status:', error));
@@ -492,7 +498,7 @@ class VideoAnalyticsServer:
                 'rtsp_url': self.rtsp_url,
                 'processing': self.processing,
                 'active_visitors': len(self.active_visitors),  # Только confirmed
-                'total_visitors': self.visitor_counter,
+                'total_visitors': self.visitor_counter,  # Общее количество уникальных посетителей
                 'total_tracks': total_tracks,
                 'confirmed_tracks': confirmed_tracks,
                 'last_processed': self.last_processed.isoformat() if self.last_processed else None,
@@ -519,9 +525,11 @@ class VideoAnalyticsServer:
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 2)
                 cv2.putText(frame, f'Active Visitors: {len(self.active_visitors)}', (10, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv2.putText(frame, f'Frames: {self.frames_processed}', (10, 110),
+                cv2.putText(frame, f'Unique Visitors: {self.visitor_counter}', (10, 110),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(frame, 'Snapshot', (10, 150),
+                cv2.putText(frame, f'Frames: {self.frames_processed}', (10, 150),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, 'Snapshot', (10, 190),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
                 # Ресайзим если нужно
@@ -694,20 +702,21 @@ class VideoAnalyticsServer:
                 return self.test_frame
 
     def _init_tracker(self):
-        """Инициализация трекера (вызывается при первом кадре)"""
-        print("Initializing DeepSORT tracker...")
+        """Инициализация трекера с увеличенными таймаутами"""
+        print("Initializing DeepSORT tracker with improved settings...")
 
         # Увеличиваем порог для лучшего сопоставления
-        # Для фичей с norm~0.6, расстояние между похожими детекциями должно быть < 0.1
-        self.metric = NearestNeighborDistanceMetric("euclidean", 0.15, budget=50)  # Уменьшили порог до 0.15
+        # Для фичей с norm~0.6, расстояние между похожими детекциями должно быть < 0.25
+        self.metric = NearestNeighborDistanceMetric("euclidean", 0.25, budget=50)
 
+        # УВЕЛИЧИВАЕМ ВСЕ ТАЙМАУТЫ для стабильного трекинга
         self.tracker = Tracker(
             self.metric,
             max_iou_distance=0.8,
-            max_age=10,  # Уменьшили до 10 кадров для быстрого удаления
-            n_init=2  # Уменьшили до 2 кадров для быстрого подтверждения
+            max_age=60,  # Увеличили до 60 кадров (было 10) - ~4 секунды при 15 FPS
+            n_init=3  # Увеличили до 3 кадров для подтверждения (было 2)
         )
-        print("Tracker initialized with Euclidean distance, threshold=0.15")
+        print("Tracker initialized: Euclidean distance, threshold=0.25, max_age=60, n_init=3")
 
     def process_frame(self, frame):
         """Обработка кадра: детекция и трекинг"""
@@ -820,6 +829,9 @@ class VideoAnalyticsServer:
             # Обновление активных посетителей (ТОЛЬКО CONFIRMED)
             self.update_active_visitors(current_tracks)
 
+            # Проверяем, не вернулся ли старый посетитель
+            self._check_returning_visitors(current_tracks)
+
             # Дебаг информация после обработки
             confirmed_tracks = len([t for t in self.tracker.tracks if t.is_confirmed()])
             tentative_tracks = len([t for t in self.tracker.tracks if t.is_tentative()])
@@ -838,6 +850,18 @@ class VideoAnalyticsServer:
             traceback.print_exc()
             return {}
 
+    def _check_returning_visitors(self, current_tracks):
+        """Проверка на возвращающихся посетителей"""
+        for track_id in list(self.active_visitors.keys()):
+            # Если посетитель был удален недавно (в пределах 60 секунд)
+            if track_id not in current_tracks:
+                visitor_data = self.active_visitors[track_id]
+                time_since_gone = datetime.utcnow() - visitor_data['last_seen']
+
+                # Если ушел менее 60 секунд назад
+                if time_since_gone.total_seconds() < 60:
+                    print(f"  ⚠️ Visitor {track_id} left {time_since_gone.total_seconds():.1f}s ago, might return")
+
     def update_visitor(self, track_id, bbox, frame):
         """Обновление информации о посетителе"""
         try:
@@ -846,16 +870,21 @@ class VideoAnalyticsServer:
                 now = datetime.utcnow()
 
                 if not visitor:
+                    # Создаем НОВОГО посетителя
                     visitor = Visitor(track_id=track_id, first_seen=now, last_seen=now)
                     db.session.add(visitor)
                     db.session.commit()
                     self.visitor_counter += 1
-                    print(f"New visitor created in DB: track_id={track_id}")
-
-                db.session.commit()
+                    print(f"✅ NEW VISITOR IN DATABASE: track_id={track_id}, total={self.visitor_counter}")
+                else:
+                    # Обновляем существующего посетителя
+                    visitor.last_seen = now
+                    visitor.is_active = True
+                    db.session.commit()
+                    print(f"📝 Existing visitor updated: track_id={track_id}")
 
         except Exception as e:
-            print(f"Error updating visitor in DB: {e}")
+            print(f"❌ Error updating visitor in DB: {e}")
 
     def update_active_visitors(self, current_tracks):
         """
@@ -892,7 +921,7 @@ class VideoAnalyticsServer:
             print(f"  ⏸️ TEMPORARILY ABSENT (still in timeout): {list(temporarily_absent)}")
 
         # Удаляем неактивных (тех, кого нет в текущих confirmed треках)
-        inactive_timeout = timedelta(seconds=1)  # Всего 1 секунды ожидания!
+        inactive_timeout = timedelta(seconds=30)  # УВЕЛИЧИЛИ до 30 секунд!
         now = datetime.utcnow()
         inactive_visitors = []
 
