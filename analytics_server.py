@@ -85,6 +85,15 @@ class VideoAnalyticsServer:
     def get_stream_info(self):
         return self.stream_info
 
+    # def setup_database(self):
+    #     """Настройка базы данных"""
+    #     self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///analytics.db'
+    #     self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    #     db.init_app(self.app)
+    #
+    #     with self.app.app_context():
+    #         db.create_all()
+
     def setup_database(self):
         """Настройка базы данных"""
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///analytics.db'
@@ -92,7 +101,12 @@ class VideoAnalyticsServer:
         db.init_app(self.app)
 
         with self.app.app_context():
+            # ДЛЯ ТЕСТИРОВАНИЯ - очищаем БД каждый раз
+            db.drop_all()
             db.create_all()
+
+            self.visitor_counter = 0
+            print("✅ Database recreated. Visitor counter reset to 0.")
 
     def setup_socketio_events(self):
         """Настройка WebSocket событий"""
